@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "跨会话信使",
+    "description": "跨会话协作工具：改文件前先登记占用（claim_files / release_files），并向其他活跃会话定向发消息（send_to_session）。"
+  }
+}

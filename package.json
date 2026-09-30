@@ -1,0 +1,22 @@
+{
+  "name": "dsh-session-messenger",
+  "version": "0.3.1",
+  "private": true,
+  "type": "module",
+  "description": "Cross-session coordination for DSH: file-claim registry (claim_files / release_files, auto-registered from fs write intents), directed session messaging (send_to_session via sessionController.prompt mode: queue | steer), conflict auto-notification, multi-round structured negotiation (negotiate: offer/counter/accept/decline/escalate with a watchdog that escalates to the human and never auto-favours the writer), and an optional write hard gate.",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "files": [
+    "index.js",
+    "registry.js",
+    "negotiation.js",
+    "locale/*.json",
+    "cordis.patch.yml"
+  ],
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" }
+  }
+}

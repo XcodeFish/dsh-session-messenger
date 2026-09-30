@@ -1,0 +1,5 @@
+# dsh-session-messenger: host-only bundle; agent tools for cross-session coordination.
+- insert:
+    - id: session-messenger
+      name: 'dsh-session-messenger'
+      config: {}
