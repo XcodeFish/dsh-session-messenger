@@ -150,6 +150,7 @@ check('F9 非写入工具不受影响', guard('session-B', 'read', { file_path: 
 
 const statusB = await call('negotiate', { action: 'status', path: P1 }, 'session-B');
 check('E1 status render 带 neg id 与持有方', render('negotiate', {}, statusB).includes(neg1.id) && /live claims by others/.test(statusB.detail), statusB.detail);
+check('E4 status 带插件运行指标', /plugin v0\.4\.\d+ guard=dispute; since boot: autoClaims=\d+ overlaps=\d+ conflicts=\d+/.test(statusB.detail));
 const bad = await call('negotiate', { action: 'offer', corr: neg1.id, path: P1, terms: { action: 'release-now' } }, 'session-B');
 check('E2 写入方无权提 release-*', bad.ok === false && /only the current claim holder/.test(bad.detail));
 const wrongPath = await call('negotiate', { action: 'decline', corr: neg1.id, path: `${WS}/src/other.ts` }, 'session-B');
@@ -238,6 +239,24 @@ prompts.length = 0;
 await writeIntent('session-B', P6);
 check('I1 空闲持有方只 inject、不 prompt 唤醒 (M5)', to('session-I', 'negotiate', 'inject').length === 1 && prompts.filter((p) => p.sessionId === 'session-I' && p.mode !== 'inject').length === 0);
 
+// ------------------------------------------------ O: 只是最近写过（自动 claim）不构成冲突 (v0.4.1)
+const PO = `${WS}/package.json`;
+prompts.length = 0;
+await writeIntent('session-A', PO); // A 顺手改了一次，没有 claim_files
+await writeIntent('session-B', PO); // B 也改同一个文件
+check('O1 对方只有自动 claim 时不开协商桌', (await negsOn(PO)).length === 0);
+check('O2 写入方不被冻结', guard('session-B', 'write', { file_path: PO }) === undefined);
+check('O3 双方都留下自动 claim（台账完整）', (await claimsOn(PO)).map((c) => c.sessionId).sort().join(',') === 'session-A,session-B');
+check('O4 写入方收到一次 recent-edit 提示，持有方不被打扰', to('session-B', 'recent-edit').length === 1 && to('session-A', '').length === 0);
+await writeIntent('session-B', PO);
+await sleep(1100); // 越过 1s 意图去重窗口
+await writeIntent('session-B', PO);
+check('O5 重叠提示有冷却，不刷屏', to('session-B', 'recent-edit').length === 1);
+const oc = await call('claim_files', { paths: [PO], note: 'B declares' }, 'session-B');
+check('O6 手动 claim 不被他人自动 claim 挡住，并提示最近改动者', oc.registered === true && /recently edited by other/.test(oc.hint), oc.hint);
+const offerNoManual = await call('negotiate', { action: 'offer', path: `${WS}/src/nothing.ts`, terms: { action: 'wait-until', at: new Date(Date.now() + 60000).toISOString() } }, 'session-B');
+check('O7 对方无手动 claim 时不能手动开桌', offerNoManual.ok === false && /no manual claim/.test(offerNoManual.detail));
+
 // ---------------------------------------------------------------- L4: 工作区外写入不进台账
 await writeIntent('session-B', '/tmp/elsewhere-scratch.txt');
 check('L4 工作区外写入不登记', (await claimsOn('/tmp/elsewhere-scratch.txt')).length === 0);
@@ -256,6 +275,12 @@ const reachableList = cross.detail.split('Reachable sessions: ')[1] || '';
 check('S3 跨工作区会话默认不可达、候选不泄露', cross.ok === false && /no reachable/.test(cross.detail) && !reachableList.includes('session-X') && !reachableList.includes('sub-'), reachableList);
 const toSub = await call('send_to_session', { target: 'session-B', content: 'hi' }, 'session-B');
 check('S4 自发被拒', toSub.ok === false && /self-send/.test(toSub.detail));
+
+// ---------------------------------------------------------------- M: status.json 指标落盘
+await sleep(1300); // 事件后 1s 去抖写
+const statusJson = await readJson('status.json');
+const bootM = statusJson.boot || {};
+check('M1 status.json 在事件后刷新，指标反映本次运行', statusJson.version === '0.4.1' && bootM.overlaps >= 1 && bootM.conflicts >= 1 && bootM.denies >= 1 && statusJson.settings && statusJson.settings.guard === 'dispute', JSON.stringify(bootM).slice(0, 160));
 
 // ---------------------------------------------------------------- 收尾
 const names = registered.map((d) => d.name);

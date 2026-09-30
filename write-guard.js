@@ -7,7 +7,8 @@
  *   持有方本人永不被冻结。未发生争议的普通 claim 不拦（第一次撞册仍是 写入+开协商桌）。
  * - 'claims'：额外冻结他人的手动 claim（origin=manual）——更强，适合明确要求「先谈后改」的团队。
  * - 'off'：不拦。
- * - 自动 claim（origin=auto）永不作为拦截依据：写过一次就锁住别人 = 误伤。
+ * - 自动 claim（origin=auto）永不作为拦截依据：写过一次就锁住别人 = 误伤。v0.4.1 起由
+ *   registry 保证协商只对手动 claim 开桌，这里再以 holdsManual 兜底（旧版遗留的协商记录也不生效）。
  *
  * 覆盖面：write / edit / str_replace_editor（create/str_replace/insert）。
  * 路径解析：相对路径按调用会话 cwd 解析，统一 realpath 身份键比对（与宿主 targetKey 同算法），
@@ -36,7 +37,7 @@ export function writeTargetOf(exec) {
   return abs ? { abs, caller } : undefined;
 }
 
-export function createWriteGuard({ registry, negotiations, mode, metrics, logger }) {
+export function createWriteGuard({ registry, negotiations, mode, metrics, logger, onDeny }) {
   return (exec) => {
     try {
       if (mode === 'off') return undefined;
@@ -46,14 +47,13 @@ export function createWriteGuard({ registry, negotiations, mode, metrics, logger
       const callerId = caller.sessionId;
       const key = pathKey(abs);
       const now = Date.now();
-      const holderHolds = (holderId, k) => {
-        const own = registry.own(holderId, k);
-        return !!own && own.expiresAt > now;
-      };
+      // 只有持有方仍持有**手动** claim 时争议才冻结写入：自动 claim 只是「最近写过」，不是占用声明。
+      const holderHolds = (holderId, k) => registry.holdsManual(holderId, k, now);
       const found = negotiations ? negotiations.frozenFor(key, callerId, now, holderHolds) : undefined;
       const neg = found && !sameFamily(callerId, caller.parent, found.holder, (registry.own(found.holder, key) || {}).parent) ? found : undefined;
       if (neg) {
         metrics.denies += 1;
+        if (onDeny) onDeny();
         const holder = (neg.labels && neg.labels[neg.holder]) || neg.holder;
         return `"${abs}" is FROZEN while a claim dispute is ${neg.state} (neg ${neg.id}, holder ${holder}). Do not write it now: reply with negotiate({action:"status", path:"${abs}"}) to see the terms, or work on other files. The freeze lifts when the holder releases or the negotiation is accepted.`;
       }
@@ -61,6 +61,7 @@ export function createWriteGuard({ registry, negotiations, mode, metrics, logger
         const hit = registry.othersOn(key, callerId, now, caller.parent).find((c) => c.origin === 'manual');
         if (hit) {
           metrics.denies += 1;
+          if (onDeny) onDeny();
           return `"${abs}" is claimed by ${hit.label} (session ${hit.sessionId}, until ${iso(hit.expiresAt)}, note: ${hit.note || 'n/a'}). Negotiate first: negotiate({action:"offer", path:"${abs}", terms:{action:"wait-until", at:"<ISO within 60m>"}}), or work on other files.`;
         }
       }

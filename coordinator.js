@@ -9,9 +9,11 @@
  * - L3：同 (path, pair) 终态协商冷静期内不重开桌、不重复通知。
  * - L4：只登记会话工作区根（含 git 根）内的写入，/tmp、~/.dsh 等工具性写入不进台账。
  * - 自动通知不唤醒空闲/冷会话（M5，见 delivery.notify）。
+ * - v0.4.1：只有他人的**手动** claim 才构成冲突（开协商 + 争议冻结）；他人的自动 claim
+ *   只是「最近写过」，写入照常登记，只给写入方一条节流的重叠提示。
  */
 import { randomUUID } from 'node:crypto';
-import { ENVELOPE_TAG, intentInfo, isWithin, iso, labelFor, shortId } from './util.js';
+import { ENVELOPE_TAG, createThrottle, intentInfo, isWithin, iso, labelFor, shortId } from './util.js';
 import { PEER_NOTICE, workspaceRoot } from './delivery.js';
 
 export function createCoordinator({ registry, negotiations, delivery, logger, metrics, settings }) {
@@ -180,11 +182,13 @@ export function createCoordinator({ registry, negotiations, delivery, logger, me
     if (result.registered) {
       metrics.autoClaims += 1;
       persistClaims();
+      if (result.overlaps && result.overlaps.length > 0) notifyOverlap(entry, result.overlaps[0], writerId, writerLabel);
       return;
     }
     const conflict = result.conflicts[0];
     if (!conflict) return;
     metrics.conflicts += 1;
+    significant();
     logger?.warn?.(
       `[session-messenger] CONFLICT(auto): ${writerLabel} writing ${entry.path} claimed by ${conflict.ownerLabel} (session ${conflict.ownerSessionId}, ${conflict.ownerOrigin})`
     );
@@ -241,6 +245,37 @@ export function createCoordinator({ registry, negotiations, delivery, logger, me
     metrics.notifies += 2;
   };
 
+  /**
+   * 重叠提示（v0.4.1）：对方只是最近写过同一文件（自动 claim，无占用声明）。
+   * 不开协商、不冻结，只给写入方一条低优先级提示，让它知道有人刚动过这个文件；
+   * 每 (写入方, 路径, 对方) 冷却窗口内最多一次，且不唤醒空闲/冷会话（delivery.notify）。
+   */
+  const overlapThrottle = createThrottle();
+  const significant = () => {
+    try {
+      if (typeof api.onSignificant === 'function') api.onSignificant();
+    } catch {
+      /* status is best-effort */
+    }
+  };
+  const notifyOverlap = (entry, other, writerId, writerLabel) => {
+    metrics.overlaps += 1;
+    significant();
+    if (!settings.autoNotify) return;
+    if (!overlapThrottle(`${writerId}|${entry.key}|${other.ownerSessionId}`, settings.overlapCooldownMs)) return;
+    delivery.notify(
+      writerId,
+      autoEnvelope('recent-edit', [
+        `path: ${entry.path}`,
+        `other: ${other.ownerLabel} (session ${other.ownerSessionId}) — edited it recently (no claim), until ${iso(other.expiresAt)}`,
+        `writer: ${writerLabel} — this is you`,
+        '',
+        '提示：另一个会话最近改过这个文件（它没有声明占用，你的写入已正常完成、不会被拦）。如果你们可能在改同一处逻辑，可用 send_to_session 知会对方，或先 claim_files 声明意图。无需回复。'
+      ])
+    );
+    metrics.notifies += 1;
+  };
+
   const safeSessionLive = (sessionId) => {
     try {
       return delivery.liveSessions().some((s) => s.id === sessionId);
@@ -288,8 +323,13 @@ export function createCoordinator({ registry, negotiations, delivery, logger, me
         notifyNegotiation(neg, neg.writer);
       }
       for (const neg of dueWakes) notifyNegotiation(neg, neg.writer);
-      // 持有方已不再持有（释放/过期）的开放协商收敛为 resolved——冻结随之解除。
-      const heldKeys = new Set(registry.listLive(now).map((c) => `${c.sessionId}\u0000${c.key}`));
+      // 持有方已不再持有**手动** claim（释放/过期/只剩自动登记）的开放协商收敛为 resolved——冻结随之解除。
+      const heldKeys = new Set(
+        registry
+          .listLive(now)
+          .filter((c) => c.origin === 'manual')
+          .map((c) => `${c.sessionId}\u0000${c.key}`)
+      );
       let resolved = 0;
       for (const neg of negotiations.negotiations.values()) {
         if (neg.state !== 'open' || heldKeys.has(`${neg.holder}\u0000${neg.key}`)) continue;
@@ -305,5 +345,6 @@ export function createCoordinator({ registry, negotiations, delivery, logger, me
     }
   };
 
-  return { handleWriteIntent, handleSessionDisposed, runWatchdogOnce, renderNegotiation, notifyNegotiation, openNegotiation, applyEffects, persistClaims, persistNegotiations };
+  const api = { handleWriteIntent, handleSessionDisposed, runWatchdogOnce, renderNegotiation, notifyNegotiation, openNegotiation, applyEffects, persistClaims, persistNegotiations, onSignificant: undefined, statusText: undefined };
+  return api;
 }

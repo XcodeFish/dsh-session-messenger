@@ -82,7 +82,14 @@ export function buildTools({ registry, negotiations, delivery, coordinator, metr
           registered: true,
           expiresAt: result.expiresAt,
           conflicts: [],
-          hint: `Claim registered for ${entries.length} path(s) until ${iso(result.expiresAt)}. Run release_files when done.`
+          hint: `Claim registered for ${entries.length} path(s) until ${iso(result.expiresAt)}. Run release_files when done.${
+            result.overlaps && result.overlaps.length
+              ? ` Note: recently edited by other session(s) without a claim: ${result.overlaps
+                  .slice(0, 5)
+                  .map((o) => `${o.path} ← ${o.ownerLabel} (session ${o.ownerSessionId})`)
+                  .join('; ')}.`
+              : ''
+          }`
         };
       } catch (error) {
         return fail('', String((error && error.message) || error));
@@ -208,8 +215,8 @@ export function buildTools({ registry, negotiations, delivery, coordinator, metr
           neg = open[0];
         }
         if (!neg && (action === 'offer' || action === 'counter')) {
-          const holder = registry.othersOn(entry.key, caller.sessionId, now, caller.parent)[0];
-          if (!holder) return respond(false, null, false, `no live claim by another session on ${entry.path}; nothing to negotiate (claim_files it yourself)`);
+          const holder = registry.othersOn(entry.key, caller.sessionId, now, caller.parent).find((c) => c.origin === 'manual');
+          if (!holder) return respond(false, null, false, `no manual claim by another session on ${entry.path}; nothing to negotiate (recent edits by others do not block you — claim_files it yourself)`);
           neg = coordinator.openNegotiation(entry, holder.sessionId, holder.label, caller.sessionId, labelFor(caller.sessionId, caller.cwd), now).neg;
           if (!neg) return respond(false, null, false, 'could not open a negotiation');
           // 不在此处单独通知持有方：下面的 offer 转移会带着条款通知一次，避免重复打扰。
@@ -255,7 +262,8 @@ export function buildTools({ registry, negotiations, delivery, coordinator, metr
     const claimLine = others.length
       ? `live claims by others: ${others.map((c) => `${c.label} (session ${c.sessionId}, ${c.origin}, until ${iso(c.expiresAt)})`).join('; ')}`
       : 'no live claim by another session';
-    return `${rows.length ? rows.join(' | ') : 'no negotiation on this path involving you'}; ${claimLine}`;
+    const plugin = typeof coordinator.statusText === 'function' ? ` [${coordinator.statusText()}]` : '';
+    return `${rows.length ? rows.join(' | ') : 'no negotiation on this path involving you'}; ${claimLine}${plugin}`;
   };
 
   void metrics;

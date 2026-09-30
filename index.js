@@ -25,7 +25,7 @@
  */
 import { ClaimRegistry } from './registry.js';
 import { NegotiationStore } from './negotiation.js';
-import { acquireDataDir, defaultDataDir, migrateLegacyData } from './storage.js';
+import { acquireDataDir, defaultDataDir, migrateLegacyData, StatusFile } from './storage.js';
 import { Delivery } from './delivery.js';
 import { createCoordinator } from './coordinator.js';
 import { createWriteGuard, guardMode } from './write-guard.js';
@@ -36,12 +36,14 @@ export const name = 'session-messenger';
 export const inject = ['tools'];
 
 const SERVICE_FALLBACK_MS = 3000;
+export const VERSION = '0.4.1';
 
 function readSettings(config) {
   const cfg = config && typeof config === 'object' ? config : {};
   return {
     autoClaimTtlSeconds: envNumber('DSH_SESSION_MESSENGER_AUTO_TTL_S', Number(cfg.autoClaimTtlSeconds) || 600, { min: 30 }),
     autoNotify: process.env.DSH_SESSION_MESSENGER_AUTO_NOTIFY !== '0' && cfg.autoNotify !== false,
+    overlapCooldownMs: envNumber('DSH_SESSION_MESSENGER_OVERLAP_COOLDOWN_MS', 30 * 60 * 1000, { min: 0 }),
     negotiate: process.env.DSH_SESSION_MESSENGER_NEGOTIATE !== '0' && cfg.negotiate !== false,
     negDeadlineMs: envNumber('DSH_SESSION_MESSENGER_NEG_DEADLINE_MS', 10 * 60 * 1000, { min: 100 }),
     negMaxRounds: envNumber('DSH_SESSION_MESSENGER_NEG_MAX_ROUNDS', 6, { min: 1 }),
@@ -136,7 +138,7 @@ export function apply(ctx, config) {
       if (disposed) return;
 
       const metrics = {
-        autoClaims: 0, conflicts: 0, notifies: 0, notifySkippedCold: 0, denies: 0, unattributed: 0, outOfScope: 0,
+        autoClaims: 0, overlaps: 0, conflicts: 0, notifies: 0, notifySkippedCold: 0, denies: 0, unattributed: 0, outOfScope: 0,
         releases: 0, escalations: 0, orphanCleared: 0, negotiationsOpened: 0, cooldownSuppressed: 0
       };
       const delivery = new Delivery({
@@ -148,6 +150,42 @@ export function apply(ctx, config) {
         crossWorkspace: settings.crossWorkspace
       });
       const coordinator = createCoordinator({ registry, negotiations, delivery, logger, metrics, settings });
+      const status = new StatusFile(dir, {
+        version: VERSION,
+        settings: { guard: settings.guard, negotiate: !!negotiations, autoNotify: settings.autoNotify, scopeToWorkspace: settings.scopeToWorkspace, crossWorkspace: settings.crossWorkspace },
+        logger
+      });
+      await status.load();
+      if (disposed) return;
+      const writeStatus = () =>
+        status.write(metrics, {
+          liveClaims: registry.listLive(Date.now()).length,
+          openNegotiations: negotiations ? [...negotiations.negotiations.values()].filter((n) => n.state === 'open').length : 0,
+          agentsService: !!delivery.agents
+        });
+      coordinator.statusText = () => {
+        const snap = status.snapshot(metrics);
+        const b = snap.boot;
+        return `plugin v${VERSION} guard=${settings.guard}; since boot: autoClaims=${b.autoClaims} overlaps=${b.overlaps} conflicts=${b.conflicts} denies=${b.denies} negotiationsOpened=${b.negotiationsOpened} escalations=${b.escalations} orphanCleared=${b.orphanCleared}`;
+      };
+      writeStatus();
+      // 周期写 + 有意义事件后的去抖写（冲突/拦截/协商/清理），灰度观察不必等满一分钟。
+      let statusDebounce = null;
+      coordinator.onSignificant = () => {
+        if (statusDebounce) return;
+        statusDebounce = setTimeout(() => {
+          statusDebounce = null;
+          writeStatus();
+        }, 1000);
+        statusDebounce.unref?.();
+      };
+      track(() => statusDebounce && clearTimeout(statusDebounce));
+      const statusTimer = setInterval(writeStatus, 60000);
+      statusTimer.unref?.();
+      track(() => {
+        clearInterval(statusTimer);
+        writeStatus();
+      });
 
       // 写入意图观测：宿主在 agent 作用域 ctx 上分发 fs 瀑布，根级插件须经 internal/dispatch
       // 进程级旁听（宿主 dsh-fs 守卫同款）。只保留这一条通道——双通道会让同一事件处理两次。
@@ -171,7 +209,7 @@ export function apply(ctx, config) {
       track(ctx.on('internal/dispatch', dispatchListener, { global: true }));
 
       if (typeof ctx.tools.guard === 'function' && settings.guard !== 'off') {
-        track(ctx.tools.guard(createWriteGuard({ registry, negotiations, mode: settings.guard, metrics, logger })));
+        track(ctx.tools.guard(createWriteGuard({ registry, negotiations, mode: settings.guard, metrics, logger, onDeny: () => coordinator.onSignificant && coordinator.onSignificant() })));
       } else if (settings.guard !== 'off') {
         logger?.warn?.('[session-messenger] ctx.tools.guard unavailable; dispute freeze is off');
       }
@@ -204,7 +242,7 @@ export function apply(ctx, config) {
         }
       }
       logger?.info?.(
-        `[session-messenger] activated: 4 tools; data=${dir}; guard=${settings.guard}; negotiate=${negotiations ? 'on' : 'off'}; auto-notify=${settings.autoNotify ? 'on' : 'off'}; scope=${settings.scopeToWorkspace ? 'workspace' : 'all'}; cross-workspace=${settings.crossWorkspace ? 'on' : 'off'}; agents=${delivery.agents ? 'yes' : 'not yet (auto notices degrade to queue until available)'}`
+        `[session-messenger] v${VERSION} activated: 4 tools; data=${dir}; guard=${settings.guard}; negotiate=${negotiations ? 'on' : 'off'}; auto-notify=${settings.autoNotify ? 'on' : 'off'}; scope=${settings.scopeToWorkspace ? 'workspace' : 'all'}; cross-workspace=${settings.crossWorkspace ? 'on' : 'off'}; agents=${delivery.agents ? 'yes' : 'not yet (auto notices degrade to queue until available)'}`
       );
     } catch (error) {
       activating = false;

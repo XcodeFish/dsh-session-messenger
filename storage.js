@@ -156,3 +156,50 @@ export class JsonFile {
     return this.running;
   }
 }
+
+/**
+ * 运行状态文件（灰度观察用）：status.json 记录版本、启动时间、设置与累计指标。
+ * 指标跨重启累计（启动时读回旧值，按 bootId 区分本次与历史），便于算误冻结率等比率。
+ */
+export class StatusFile {
+  constructor(dataDir, { version, settings, logger }) {
+    this.file = new JsonFile(path.join(dataDir, 'status.json'));
+    this.version = version;
+    this.settings = settings;
+    this.logger = logger;
+    this.startedAt = Date.now();
+    this.bootId = randomUUID().slice(0, 8);
+    this.previous = {};
+  }
+
+  async load() {
+    try {
+      const parsed = await this.file.read();
+      this.previous = parsed && parsed.lifetime && typeof parsed.lifetime === 'object' ? parsed.lifetime : {};
+    } catch {
+      this.previous = {};
+    }
+  }
+
+  snapshot(metrics, extra = {}) {
+    const lifetime = { ...this.previous };
+    for (const [k, v] of Object.entries(metrics)) lifetime[k] = (Number(this.previous[k]) || 0) + v;
+    return {
+      version: this.version,
+      pid: process.pid,
+      bootId: this.bootId,
+      startedAt: new Date(this.startedAt).toISOString(),
+      savedAt: new Date().toISOString(),
+      settings: this.settings,
+      boot: { ...metrics },
+      lifetime,
+      ...extra
+    };
+  }
+
+  write(metrics, extra) {
+    return this.file.write(() => this.snapshot(metrics, extra)).catch((error) => {
+      this.logger?.warn?.(`[session-messenger] status write failed: ${(error && error.message) || error}`);
+    });
+  }
+}

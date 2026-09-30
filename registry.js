@@ -96,26 +96,31 @@ export class ClaimRegistry {
   }
 
   /**
-   * All-or-nothing 登记。
+   * All-or-nothing 登记。冲突语义（v0.4.1）：
+   * - 只有他人的**手动** claim（明确声明的意图）构成冲突 → 一条都不登记，返回 conflicts。
+   * - 他人的**自动** claim（只是最近写过）不构成冲突：照常登记，返回 overlaps 供调用方做
+   *   低优先级提示——否则「顺手改过一次」就会锁住别人（v0.4.0 真机前复现的误冻结）。
    * @param entries - [{ path, key }]
    * @param origin - 'manual'（claim_files）| 'auto'（写入意图）
    */
   claim({ sessionId, parent = '', label, cwd, sessionOrigin, entries, ttlSeconds, note, origin, now }) {
     this.prune(now);
     const conflicts = [];
+    const overlaps = [];
     for (const entry of entries) {
       for (const c of this.othersOn(entry.key, sessionId, now, parent)) {
-        conflicts.push({
+        const row = {
           path: entry.path,
           ownerSessionId: c.sessionId,
           ownerLabel: c.label || c.sessionId,
           ownerOrigin: c.origin,
           expiresAt: c.expiresAt,
           note: c.note || ''
-        });
+        };
+        (c.origin === 'manual' ? conflicts : overlaps).push(row);
       }
     }
-    if (conflicts.length > 0) return { registered: false, conflicts, expiresAt: 0 };
+    if (conflicts.length > 0) return { registered: false, conflicts, overlaps, expiresAt: 0 };
     const target = now + ttlSeconds * 1000;
     let expiresAt = target;
     for (const entry of entries) {
@@ -142,7 +147,13 @@ export class ClaimRegistry {
         note: note || (existing && existing.origin === 'manual' ? existing.note : '') || ''
       });
     }
-    return { registered: true, conflicts: [], expiresAt };
+    return { registered: true, conflicts: [], overlaps, expiresAt };
+  }
+
+  /** 该会话在该路径上是否持有未过期的**手动** claim（协商与冻结的唯一依据）。 */
+  holdsManual(sessionId, key, now) {
+    const own = this.claims.get(keyOf(sessionId, key));
+    return !!own && own.origin === 'manual' && own.expiresAt > now;
   }
 
   /** 释放本会话的 claim：keys 为 null 时全部释放。返回释放条数。 */

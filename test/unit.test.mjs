@@ -53,6 +53,39 @@ test('registry: all-or-nothing and family exemption', () => {
   assert.equal(child.registered, true, 'child of holder is not a conflict');
 });
 
+test('registry: another session\'s AUTO claim is an overlap, not a conflict (v0.4.1)', () => {
+  const r = new ClaimRegistry({ dataDir: tmp() });
+  r.claim({ sessionId: 'A', entries: [E('/w/pkg.json')], ttlSeconds: 600, origin: 'auto', note: 'auto:write', now: T0 });
+  const auto = r.claim({ sessionId: 'B', entries: [E('/w/pkg.json')], ttlSeconds: 600, origin: 'auto', note: 'auto:write', now: T0 + 1000 });
+  assert.equal(auto.registered, true, 'writer is not blocked by a recent edit');
+  assert.equal(auto.conflicts.length, 0);
+  assert.equal(auto.overlaps.length, 1);
+  assert.equal(auto.overlaps[0].ownerSessionId, 'A');
+  const manual = r.claim({ sessionId: 'C', entries: [E('/w/pkg.json')], ttlSeconds: 600, origin: 'manual', now: T0 + 2000 });
+  assert.equal(manual.registered, true, 'manual claim_files is not blocked by others\' auto claims either');
+  assert.equal(manual.overlaps.length, 2);
+  const late = r.claim({ sessionId: 'D', entries: [E('/w/pkg.json')], ttlSeconds: 600, origin: 'auto', now: T0 + 3000 });
+  assert.equal(late.registered, false, 'once C declared a manual claim, others conflict');
+  assert.deepEqual(late.conflicts.map((c) => c.ownerSessionId), ['C']);
+  assert.equal(r.holdsManual('C', pathKey('/w/pkg.json'), T0 + 3000), true);
+  assert.equal(r.holdsManual('A', pathKey('/w/pkg.json'), T0 + 3000), false);
+});
+
+test('write-guard: a dispute only freezes while the holder has a MANUAL claim (v0.4.1)', () => {
+  const r = new ClaimRegistry({ dataDir: tmp() });
+  const n = new NegotiationStore({ dataDir: tmp(), deadlineMs: 600000, maxRounds: 6, rateMs: 0, cooldownMs: 600000 });
+  const now = Date.now();
+  const P = '/w/package.json';
+  const key = pathKey(P);
+  r.claim({ sessionId: 'A', entries: [{ path: P, key }], ttlSeconds: 600, origin: 'auto', note: 'auto:write', now: now - 300000 });
+  n.open({ id: 'legacy', path: P, key, a: 'A', b: 'B', holder: 'A', writer: 'B', now }); // e.g. opened by v0.4.0 before upgrade
+  const g = createWriteGuard({ registry: r, negotiations: n, mode: 'dispute', metrics: { denies: 0 } });
+  const ex = { name: 'write', arguments: { file_path: P }, agent: { id: 'B', session: { header: { id: 'B', cwd: '/w' } } } };
+  assert.equal(g(ex), undefined, 'recent auto edit by A never freezes B');
+  r.claim({ sessionId: 'A', entries: [{ path: P, key }], ttlSeconds: 600, origin: 'manual', note: 'A declares', now });
+  assert.match(g(ex), /FROZEN/, 'after A declares a manual claim the dispute freezes');
+});
+
 test('registry: expired claims are pruned and do not conflict', () => {
   const r = new ClaimRegistry({ dataDir: tmp() });
   r.claim({ sessionId: 'A', entries: [E('/w/a.ts')], ttlSeconds: 30, origin: 'manual', now: T0 });
