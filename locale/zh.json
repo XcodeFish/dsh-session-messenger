@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "跨会话信使",
-    "description": "跨会话协作工具：改文件前先登记占用（claim_files / release_files），并向其他活跃会话定向发消息（send_to_session）。"
+    "description": "多会话并行改同一仓库时的协作：写入自动登记占用、冲突时开协商并冻结争议文件、用 negotiate 多轮协商，并可向同工作区会话发消息（claim_files / release_files / negotiate / send_to_session）。"
   }
 }

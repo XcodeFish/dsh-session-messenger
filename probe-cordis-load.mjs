@@ -13,7 +13,7 @@
  *    `dsh desktop host exited with 1` = 桌面端进恢复模式。探针把任何 uncaught 记为失败。
  *
  * 用法：
- *   node probe-cordis-load.mjs              # 服务齐全：期望注册 3 个工具、0 uncaught
+ *   node probe-cordis-load.mjs              # 服务齐全：期望注册 4 个工具、守卫 1 个、0 uncaught
  *   SKIP_PROVIDER=1 node probe-cordis-load.mjs   # 服务缺失：期望保持惰性、0 uncaught
  *
  * 环境变量：
@@ -41,9 +41,14 @@ const registered = [];
 const app = new Context();
 
 // tools 由 root 提供（等价于 base 的 tools 服务，属性直取本来就可见）。
+const guards = [];
 app.provide('tools', {
   register: (definition) => {
     registered.push(definition);
+    return () => {};
+  },
+  guard: (fn) => {
+    guards.push(fn);
     return () => {};
   }
 });
@@ -71,11 +76,14 @@ await new Promise((resolve) => setTimeout(resolve, 3600));
 const names = registered.map((d) => d.name);
 console.log('plugin under test:', path.resolve(PLUGIN));
 console.log('registered tools:', JSON.stringify(names));
+console.log('guards:', guards.length);
 console.log('uncaught exceptions:', uncaught.length);
 
 await app.stop?.();
+const { rm } = await import('node:fs/promises');
+await rm(path.join(process.cwd(), '.probe-claims'), { recursive: true, force: true });
 
 const expectTools = !process.env.SKIP_PROVIDER;
-const ok = uncaught.length === 0 && (expectTools ? names.length === 4 : true);
+const ok = uncaught.length === 0 && (expectTools ? names.length === 4 && guards.length === 1 : names.length === 0);
 console.log(ok ? 'PROBE PASS' : 'PROBE FAIL');
 process.exit(ok ? 0 : 1);

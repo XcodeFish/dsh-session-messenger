@@ -10,7 +10,7 @@
  * 3. fire-and-forget persist 会并发竞态，必须走 persistCoalesced()（本探针两段式断言可捕获回归）。
  *
  * 用法：node probe-l0-autoregister.mjs
- * 退出码 0 = PASS（0 uncaught 且 write/edit 两个事件各自的自动登记都正确落盘）
+ * 退出码 0 = PASS（0 uncaught；write 意图自动登记落盘；紧随的 edit 意图只延长不覆盖——合并写无丢更新）
  */
 import path from 'node:path';
 import { promises as fs } from 'node:fs';
@@ -31,6 +31,9 @@ process.on('uncaughtException', (error) => {
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 await fs.rm(DATA_DIR, { recursive: true, force: true });
+// 自动登记只收工作区根内的写入：造一个带 .git 的临时工作区。
+await fs.rm('/tmp/messenger-l0-ws', { recursive: true, force: true });
+await fs.mkdir('/tmp/messenger-l0-ws/.git', { recursive: true });
 
 const { Context } = await import(
   pathToFileURL(path.join(APP, 'node_modules/@deepseek-ai/cordis/lib/index.js')).href
@@ -42,7 +45,8 @@ app.provide('tools', {
   register: (definition) => {
     registered.push(definition);
     return () => {};
-  }
+  },
+  guard: () => () => {}
 });
 
 // sessions / sessionController 由兄弟 fiber 提供（还原生产可见性）。
@@ -85,6 +89,8 @@ async function readClaims() {
 }
 
 const expectedPath = path.normalize(path.join(WORKSPACE, 'src/probe.ts'));
+// 同一 (session,path) 的第二次意图是「延长」而非覆盖 note（H2 语义），故 edit 阶段断言
+// 条目仍在且 TTL 未缩短，而不是 note 变成 auto:edit。
 
 // 两段式：同一 (session,path) 的记录会被后一次操作 upsert，故必须分步断言，
 // 否则无法区分「edit 事件没到」与「两事件都到但都写同一条」。
@@ -98,9 +104,9 @@ const writeOk = afterWrite.some(
 await emitIntent('fs/edit-intent');
 await sleep(500);
 const afterEdit = await readClaims();
-const editOk = afterEdit.some(
-  (c) => c.path === expectedPath && c.note === 'auto:edit' && c.sessionId === 'session-l0-probe'
-);
+const writeEntry = afterWrite.find((c) => c.path === expectedPath);
+const editEntry = afterEdit.find((c) => c.path === expectedPath);
+const editOk = !!editEntry && editEntry.origin === 'auto' && !!writeEntry && editEntry.expiresAt >= writeEntry.expiresAt;
 
 console.log('plugin under test:', path.resolve(PLUGIN));
 console.log('registered tools:', JSON.stringify(registered.map((d) => d.name)));
@@ -110,6 +116,7 @@ console.log('uncaught exceptions:', uncaught.length);
 
 await app.stop?.();
 await fs.rm(DATA_DIR, { recursive: true, force: true });
+await fs.rm('/tmp/messenger-l0-ws', { recursive: true, force: true });
 
 const ok = uncaught.length === 0 && writeOk && editOk;
 console.log(ok ? 'PROBE PASS' : `PROBE FAIL (write=${writeOk} edit=${editOk})`);

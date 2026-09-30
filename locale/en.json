@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Session Messenger",
-    "description": "Cross-session coordination tools: claim files before editing (claim_files / release_files) and message other live sessions (send_to_session)."
+    "description": "Coordination for parallel sessions in one repository: auto-registered file claims, a negotiation plus write freeze on disputed files, multi-round negotiate, and peer messages within a workspace (claim_files / release_files / negotiate / send_to_session)."
   }
 }

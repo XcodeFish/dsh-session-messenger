@@ -1,9 +1,9 @@
 {
   "name": "dsh-session-messenger",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "private": true,
   "type": "module",
-  "description": "Cross-session coordination for DSH: file-claim registry (claim_files / release_files, auto-registered from fs write intents), directed session messaging (send_to_session via sessionController.prompt mode: queue | steer), conflict auto-notification, multi-round structured negotiation (negotiate: offer/counter/accept/decline/escalate with a watchdog that escalates to the human and never auto-favours the writer), and an optional write hard gate.",
+  "description": "Cross-session coordination for DSH: file-claim registry (manual claim_files plus auto-registration from fs write intents), multi-round structured negotiation (negotiate) with a dispute-scoped write freeze via tools.guard, a watchdog that escalates to the human and never auto-favours the writer, and rate-limited peer messaging (send_to_session) within one workspace.",
   "exports": {
     ".": "./index.js",
     "./package.json": "./package.json",
@@ -11,11 +11,23 @@
   },
   "files": [
     "index.js",
+    "util.js",
+    "storage.js",
     "registry.js",
     "negotiation.js",
+    "delivery.js",
+    "coordinator.js",
+    "write-guard.js",
+    "tools.js",
+    "schemas.generated.js",
     "locale/*.json",
     "cordis.patch.yml"
   ],
+  "scripts": {
+    "test": "node --test test/unit.test.mjs",
+    "check:schemas": "node extract-specs.mjs --check",
+    "probe": "node probe-cordis-load.mjs && SKIP_PROVIDER=1 node probe-cordis-load.mjs && node probe-l0-autoregister.mjs && node probe-negotiation.mjs"
+  },
   "dsh": {
     "bundle": { "patch": "./cordis.patch.yml" }
   }

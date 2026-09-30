@@ -1,161 +1,158 @@
 /**
- * ClaimRegistry — 插件自有存储的文件占用登记表。
+ * ClaimRegistry — 文件占用登记表（内存真相 + 原子落盘）。
  *
- * 设计要点（对应方案评审结论）：
- * - 绝不写 session event（practices.md 明文：自定义事件类型会让 Session 拒绝重开），
- *   状态落在插件自有 JSON 文件（~/.dsh/plugin-data/dsh-session-messenger/claims.json）。
- * - 单 Host 进程内存真相 + 落盘持久（跨重启保留未过期 claim），原子写（tmp + rename）。
- * - 键 = (sessionId, 绝对路径)；每条 claim 必带 TTL，过期即剪枝（防死锁的兜底）。
- * - 所有变更经进程内串行队列，避免并发读写交错。
+ * 数据模型：键 = (sessionId, 路径身份键 key)。每条 claim：
+ *   { sessionId, parent(父会话 id，子代理才有), label, cwd, path(展示用绝对路径), key(realpath 身份键),
+ *     origin:'manual'|'auto', sessionOrigin:'session'|'subagent', claimedAt, expiresAt, note }
+ * - 同一家族（父会话与其子代理）之间不构成冲突，见 util.sameFamily。
+ *
+ * 语义要点（逐条对应审查结论）：
+ * - H2：自动登记（写入意图）绝不削弱手动 claim——同会话已有 claim 时只把 expiresAt 延长到
+ *   max(现有, now+autoTtl)，保留原 note / origin / claimedAt；手动再 claim 同路径则升级为 manual。
+ * - All-or-nothing：任一路径被他人活 claim 占用 → 一条都不登记，返回冲突列表。
+ * - M4：唯一落盘入口 persist()（JsonFile 合并写），不存在两条互不感知的写路径。
+ * - M7：load() 完成前 ready=false；调用方必须在 ready 之后才对外提供工具。
+ * - 同步 API：所有变更在单 tick 内完成（Node 单线程），天然无交错；落盘异步合并。
  */
-import { promises as fs } from 'node:fs';
 import path from 'node:path';
+import { JsonFile } from './storage.js';
+import { pathKey, labelFor, isLegacyLabel, originOfHeader, sameFamily } from './util.js';
 
-const keyOf = (sessionId, absPath) => `${sessionId}\u0000${absPath}`;
+const FORMAT_VERSION = 2;
+const keyOf = (sessionId, key) => `${sessionId}\u0000${key}`;
 
 export class ClaimRegistry {
   constructor({ dataDir, logger }) {
-    this.dir = dataDir;
-    this.file = path.join(dataDir, 'claims.json');
+    this.file = new JsonFile(path.join(dataDir, 'claims.json'));
     this.logger = logger;
-    /** @type {Map<string, {sessionId:string,label:string,cwd:string,path:string,claimedAt:number,expiresAt:number,note:string}>} */
+    /** @type {Map<string, object>} */
     this.claims = new Map();
-    this.loaded = false;
-    /** @type {Promise<void>} */
-    this.chain = Promise.resolve();
-  }
-
-  /** Serialize every mutation/read-modify-write through one in-process queue. */
-  serialized(fn) {
-    const run = this.chain.then(fn, fn);
-    this.chain = run.then(
-      () => undefined,
-      () => undefined
-    );
-    return run;
+    this.ready = false;
   }
 
   async load(now) {
-    if (this.loaded) return;
-    this.loaded = true;
+    if (this.ready) return;
     try {
-      const raw = await fs.readFile(this.file, 'utf8');
-      const parsed = JSON.parse(raw);
-      const list = Array.isArray(parsed && parsed.claims) ? parsed.claims : [];
+      const parsed = await this.file.read();
+      const list = parsed && Array.isArray(parsed.claims) ? parsed.claims : [];
       for (const c of list) {
-        if (!c || typeof c.path !== 'string' || typeof c.sessionId !== 'string') continue;
+        if (!c || typeof c.path !== 'string' || typeof c.sessionId !== 'string' || !path.isAbsolute(c.path)) continue;
         const expiresAt = Number(c.expiresAt) || 0;
         if (expiresAt <= now) continue;
-        this.claims.set(keyOf(c.sessionId, c.path), {
+        const key = typeof c.key === 'string' && c.key ? c.key : pathKey(c.path);
+        const legacyAuto = String(c.note || '').startsWith('auto:');
+        const origin = c.origin === 'manual' || c.origin === 'auto' ? c.origin : legacyAuto ? 'auto' : 'manual';
+        this.claims.set(keyOf(c.sessionId, key), {
           sessionId: c.sessionId,
-          label: typeof c.label === 'string' ? c.label : c.sessionId,
+          parent: typeof c.parent === 'string' ? c.parent : '',
+          label: isLegacyLabel(c.label) ? labelFor(c.sessionId, c.cwd) : c.label,
           cwd: typeof c.cwd === 'string' ? c.cwd : '',
           path: c.path,
+          key,
+          origin,
+          sessionOrigin:
+            c.sessionOrigin === 'subagent' || c.sessionOrigin === 'session' ? c.sessionOrigin : originOfHeader(undefined, c.sessionId),
           claimedAt: Number(c.claimedAt) || now,
           expiresAt,
           note: typeof c.note === 'string' ? c.note : ''
         });
       }
     } catch (error) {
-      if (error && error.code !== 'ENOENT') {
-        this.logger?.warn?.(`[session-messenger] claims load failed, starting empty: ${error.message || error}`);
-      }
+      this.logger?.warn?.(`[session-messenger] claims load failed, starting empty: ${(error && error.message) || error}`);
+    } finally {
+      this.ready = true;
     }
+  }
+
+  persist() {
+    return this.file.write(() => ({ version: FORMAT_VERSION, savedAt: Date.now(), claims: [...this.claims.values()] }));
   }
 
   prune(now) {
-    for (const [key, claim] of this.claims) {
-      if (claim.expiresAt <= now) this.claims.delete(key);
+    let removed = 0;
+    for (const [k, claim] of this.claims) {
+      if (claim.expiresAt <= now) {
+        this.claims.delete(k);
+        removed += 1;
+      }
     }
+    return removed;
   }
 
-  /** 快照全部活 claim（先剪枝）；供硬闸门等只读消费方使用。 */
   listLive(now) {
     this.prune(now);
     return [...this.claims.values()];
   }
 
-  async persist() {
-    const tmp = `${this.file}.${process.pid}.${Date.now()}.tmp`;
-    const payload = JSON.stringify(
-      { version: 1, savedAt: Date.now(), claims: [...this.claims.values()] },
-      null,
-      2
-    );
-    await fs.mkdir(this.dir, { recursive: true });
-    await fs.writeFile(tmp, payload, 'utf8');
-    await fs.rename(tmp, this.file);
+  /** 他人（非本会话、非同家族）在该身份键上的活 claim；manual 优先、到期晚者优先。 */
+  othersOn(key, sessionId, now, parent = '') {
+    return this.listLive(now)
+      .filter((c) => c.key === key && !sameFamily(sessionId, parent, c.sessionId, c.parent))
+      .sort((x, y) => (x.origin === y.origin ? y.expiresAt - x.expiresAt : x.origin === 'manual' ? -1 : 1));
+  }
+
+  own(sessionId, key) {
+    return this.claims.get(keyOf(sessionId, key));
   }
 
   /**
-   * 合并写：L0 自动登记是 fire-and-forget，多个写入意图可能在毫秒内连续触发
-   * （同一工具的 write 紧接 edit）。naive 的并发 persist 会让后 rename 的旧快照
-   * 覆盖新快照（2026-09-30 L0 探针实测：auto:edit 消失、只剩 auto:write）。
-   * 这里用「飞行中再脏就跑第二轮」的合并写，保证最终落盘的是最后一次内存状态。
+   * All-or-nothing 登记。
+   * @param entries - [{ path, key }]
+   * @param origin - 'manual'（claim_files）| 'auto'（写入意图）
    */
-  persistCoalesced() {
-    if (this.persistRunning) {
-      this.persistDirty = true;
-      return this.persistRunning;
-    }
-    this.persistRunning = (async () => {
-      try {
-        do {
-          this.persistDirty = false;
-          await this.persist();
-        } while (this.persistDirty);
-      } finally {
-        this.persistRunning = undefined;
-      }
-    })();
-    return this.persistRunning;
-  }
-
-  /**
-   * All-or-nothing claim: if ANY requested path is live-claimed by ANOTHER session,
-   * nothing is registered and the conflict list is returned.
-   */
-  claim({ sessionId, label, cwd, paths, ttlSeconds, note, now }) {
+  claim({ sessionId, parent = '', label, cwd, sessionOrigin, entries, ttlSeconds, note, origin, now }) {
     this.prune(now);
     const conflicts = [];
-    for (const absPath of paths) {
-      for (const claim of this.claims.values()) {
-        if (claim.path === absPath && claim.sessionId !== sessionId && claim.expiresAt > now) {
-          conflicts.push({
-            path: absPath,
-            ownerSessionId: claim.sessionId,
-            ownerLabel: claim.label || claim.sessionId,
-            expiresAt: claim.expiresAt,
-            note: claim.note || ''
-          });
-        }
+    for (const entry of entries) {
+      for (const c of this.othersOn(entry.key, sessionId, now, parent)) {
+        conflicts.push({
+          path: entry.path,
+          ownerSessionId: c.sessionId,
+          ownerLabel: c.label || c.sessionId,
+          ownerOrigin: c.origin,
+          expiresAt: c.expiresAt,
+          note: c.note || ''
+        });
       }
     }
     if (conflicts.length > 0) return { registered: false, conflicts, expiresAt: 0 };
-    const expiresAt = now + ttlSeconds * 1000;
-    for (const absPath of paths) {
-      // Re-claim by the same session refreshes the TTL instead of failing.
-      this.claims.delete(keyOf(sessionId, absPath));
-      this.claims.set(keyOf(sessionId, absPath), {
+    const target = now + ttlSeconds * 1000;
+    let expiresAt = target;
+    for (const entry of entries) {
+      const k = keyOf(sessionId, entry.key);
+      const existing = this.claims.get(k);
+      if (existing && origin === 'auto') {
+        // H2：自动登记只延长，不降级、不覆盖 note/origin。
+        existing.expiresAt = Math.max(existing.expiresAt, target);
+        if (isLegacyLabel(existing.label) && label) existing.label = label;
+        expiresAt = Math.min(expiresAt, existing.expiresAt);
+        continue;
+      }
+      this.claims.set(k, {
         sessionId,
+        parent: parent || '',
         label: label || sessionId,
         cwd: cwd || '',
-        path: absPath,
-        claimedAt: now,
-        expiresAt,
-        note: note || ''
+        path: entry.path,
+        key: entry.key,
+        origin,
+        sessionOrigin: sessionOrigin === 'subagent' ? 'subagent' : 'session',
+        claimedAt: existing ? existing.claimedAt : now,
+        expiresAt: target,
+        note: note || (existing && existing.origin === 'manual' ? existing.note : '') || ''
       });
     }
     return { registered: true, conflicts: [], expiresAt };
   }
 
-  /** Release this session's claims: all of them when paths is null, else only the listed ones. */
-  release(sessionId, paths) {
+  /** 释放本会话的 claim：keys 为 null 时全部释放。返回释放条数。 */
+  release(sessionId, keys) {
     let count = 0;
-    for (const [key, claim] of [...this.claims.entries()]) {
+    const wanted = keys ? new Set(keys) : null;
+    for (const [k, claim] of [...this.claims.entries()]) {
       if (claim.sessionId !== sessionId) continue;
-      if (paths && !paths.includes(claim.path)) continue;
-      this.claims.delete(key);
+      if (wanted && !wanted.has(claim.key)) continue;
+      this.claims.delete(k);
       count += 1;
     }
     return count;
