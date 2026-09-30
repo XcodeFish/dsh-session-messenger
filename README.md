@@ -83,6 +83,7 @@ node probe-cordis-load.mjs                # 真实 cordis 装载：4 工具 + 1 
 SKIP_PROVIDER=1 node probe-cordis-load.mjs  # 服务缺失：惰性，0 uncaught
 node probe-l0-autoregister.mjs            # 子作用域瀑布 → 自动登记 + 合并写
 node probe-negotiation.mjs                # 42 项端到端：冻结 / 协商 / 冷会话 / 子代理销毁 / 限速 / 伪造
+node realhost-check.mjs <A> <B> <sinceMs>  # 真机取证（只读）：读真实会话日志判定 H3 冷持有方 / M5 不唤醒
 ```
 
 ## 装载纪律（实测事故，勿回退）
