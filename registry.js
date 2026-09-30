@@ -156,6 +156,32 @@ export class ClaimRegistry {
     return !!own && own.origin === 'manual' && own.expiresAt > now;
   }
 
+  /**
+   * 原子移交（v0.4.2）：把 fromId 在 key 上的手动 claim 直接交给 to（不经「先释放再抢」）。
+   * 新 claim 为 manual、TTL 取 max(原剩余, 默认)；同时删除接收方在该路径上已有的 auto claim。
+   * @returns 新 claim；fromId 没有该 claim 时返回 undefined（调用方按「路径已空」处理）
+   */
+  transfer(fromId, key, to, now, ttlSeconds = 1800) {
+    const src = this.claims.get(keyOf(fromId, key));
+    if (!src || src.expiresAt <= now) return undefined;
+    this.claims.delete(keyOf(fromId, key));
+    const next = {
+      sessionId: String(to.sessionId),
+      parent: to.parent || '',
+      label: to.label || String(to.sessionId),
+      cwd: to.cwd || '',
+      path: src.path,
+      key,
+      origin: 'manual',
+      sessionOrigin: to.sessionOrigin === 'subagent' ? 'subagent' : 'session',
+      claimedAt: now,
+      expiresAt: Math.max(src.expiresAt, now + ttlSeconds * 1000),
+      note: `handed over by ${src.label || src.sessionId}${src.note ? ` (was: ${src.note.slice(0, 120)})` : ''}`
+    };
+    this.claims.set(keyOf(next.sessionId, key), next);
+    return next;
+  }
+
   /** 释放本会话的 claim：keys 为 null 时全部释放。返回释放条数。 */
   release(sessionId, keys) {
     let count = 0;

@@ -24,7 +24,8 @@ DSH 跨会话协作插件（host-only，零外部导入）。多个独立启动�
 | L0 自动登记 | 进程级旁听 `internal/dispatch`（`{global:true}`）中的 `fs/write-intent` / `fs/edit-intent`，按写入者登记 600s `auto` claim。只登记会话工作区根内的路径；同会话已有 claim 时只延长、不降级。 |
 | L1 冲突 → 协商 | 写入撞到他人的**手动** claim：开协商桌并通知双方。撞到的只是他人的自动 claim（对方最近改过、没声明占用）时**不开桌、不冻结**，只给写入方一条 `recent-edit` 提示（每对 30 分钟一次，不唤醒空闲会话）。**运行中的会话用 steer 插话；空闲会话只放入收件箱（`agent.inject`，不唤醒、不自动开跑）；冷会话（不在内存）不投递**，其协商留在台账，下次 `status`/写入时可见。 |
 | L2 争议冻结 | `ctx.tools.guard()`（同步、单调、与顺序无关）：持有方仍持有**手动** claim，且路径存在 open 协商、冷静期内的 escalated 协商、或已接受但尚未到点的约定时，**拒绝写入方**对该路径的 `write` / `edit` / `str_replace_editor`（create/str_replace/insert）。持有方与其子代理不受影响；持有方一释放立即解冻。 |
-| 看门狗 | 默认 30s：超时升级、到点释放/唤醒、持有方已不持有则收敛、剪枝（带待执行约定的记录不剪）。 |
+| 多写入方 | 同一文件多个会话要改时，占用方与每个写入方各自一对一协商。**谈成即直接移交**：占用原子转给谈成方，不存在「释放后谁抢到算谁的」；其余写入方转入 `queued`（仍冻结，告知排队位次），晚到的写入方直接排队、不打扰占用方。移交完成后，排队者按先来后到**改绑到新占用方**重新协商；占用方主动释放、过期或被销毁时，占用直接交给队首。已销毁的子代理会被跳过。 |
+| 看门狗 | 默认 30s：超时升级、到点移交/唤醒、持有方不再持有时交给队首或收敛、剪枝（带待执行约定的记录不剪）。`queued` 协商不走超时升级。 |
 
 守卫模式 `DSH_SESSION_MESSENGER_GUARD`（或插件行 `config.guard`）：
 
@@ -38,7 +39,8 @@ DSH 跨会话协作插件（host-only，零外部导入）。多个独立启动�
 
 | 失败模式 | 处置 |
 | --- | --- |
-| 沉默 | deadline（10 分钟，每次意图重置）→ `escalated`；占用方保留 claim，冷静期内写入方仍冻结并提示找人裁决 |
+| 沉默 | deadline（10 分钟，每次意图重置）→ `escalated`；占用方保留 claim，冷静期内写入方仍冻结并提示找人裁决；冷静期内占用方过期/释放则立即解冻并通知写入方 |
+| 同一文件被重复承诺 | 占用方已约定移交给某方后，不能再对其他写入方提 `release-*`；排队者在排队期间只能 `decline` 退出 |
 | 冷静期 | 同 (路径, 双方) 终态后 10 分钟内不重开桌、不重复打扰 |
 | 持有方是**子代理**且被销毁 | `session/disposed` 时立即释放其全部 claim，并把开放协商收敛为 `resolved` |
 | 持有方是**持久会话**但不在内存（空闲卸载 / 宿主刚重启） | **不视为已死**（宿主可冷恢复）：claim 保留，只靠 TTL / 协商 / 人工 |
@@ -83,7 +85,7 @@ node extract-specs.mjs --check            # Schema 与 spec 一致
 node probe-cordis-load.mjs                # 真实 cordis 装载：4 工具 + 1 守卫，0 uncaught
 SKIP_PROVIDER=1 node probe-cordis-load.mjs  # 服务缺失：惰性，0 uncaught
 node probe-l0-autoregister.mjs            # 子作用域瀑布 → 自动登记 + 合并写
-node probe-negotiation.mjs                # 51 项端到端：冻结 / 协商 / 冷会话 / 子代理销毁 / 限速 / 伪造 / 重叠不冻结 / 指标
+node probe-negotiation.mjs                # 68 项端到端：冻结 / 协商 / 移交排队 / 冷会话 / 子代理销毁 / 限速 / 伪造 / 重叠不冻结 / 指标
 node realhost-check.mjs <A> <B> <sinceMs>  # 真机取证（只读）：读真实会话日志判定 H3 冷持有方 / M5 不唤醒
 ```
 
@@ -98,6 +100,8 @@ node realhost-check.mjs <A> <B> <sinceMs>  # 真机取证（只读）：读真�
 7. 代码变更需重启 DSH 才会加载新模块生成（bundle toggle 只复用缓存生成）。
 
 ## 变更记录
+
+- **0.4.2**（2026-09-30）：同一文件多写入方——谈成即原子移交（`registry.transfer`），其余写入方排队（新增 `queued` 状态，冻结、不超时升级、只能退出）；移交或释放/过期/销毁后按先来后到交给队首并改绑协商；排队接手立即落盘；升级冷静期内占用方过期即解冻并通知写入方；新增 `handoffs` / `requeued` 指标；35 项单测、68 项集成检查。
 
 - **0.4.1**（2026-09-30）：修复误冻结——只有手动 claim 构成冲突与冻结依据，对方仅最近写过（自动 claim）时只发节流的 `recent-edit` 提示；`negotiate offer` 只能针对手动 claim 开桌；看门狗在持有方只剩自动 claim 时收敛协商；新增 `status.json` 运行指标与 `negotiate status` 指标行；profile 改为直接从 plugin-src 安装。
 

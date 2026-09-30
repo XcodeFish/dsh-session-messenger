@@ -114,9 +114,22 @@ export function buildTools({ registry, negotiations, delivery, coordinator, metr
         if (hasPaths && entries.length === 0) {
           return { ok: false, sessionId: caller.sessionId, released: 0, hint: `no resolvable paths: ${unresolvable.slice(0, 5).join(', ')}` };
         }
-        const released = registry.release(caller.sessionId, hasPaths ? entries.map((e) => e.key) : null);
-        if (released > 0) await coordinator.persistClaims();
-        return { ok: true, sessionId: caller.sessionId, released, hint: released > 0 ? 'Open negotiations on these paths resolve at the next watchdog tick.' : 'no matching claims' };
+        const now = Date.now();
+        const keys = hasPaths
+          ? entries.map((e) => e.key)
+          : registry.listLive(now).filter((c) => c.sessionId === caller.sessionId).map((c) => c.key);
+        const released = registry.release(caller.sessionId, hasPaths ? keys : null);
+        if (released > 0) {
+          // 有人排队的文件直接交给队首（v0.4.2），不留「谁抢到算谁的」窗口。
+          coordinator.handleReleased(caller.sessionId, keys, now);
+          await coordinator.persistClaims();
+        }
+        return {
+          ok: true,
+          sessionId: caller.sessionId,
+          released,
+          hint: released > 0 ? 'Files with queued writers were handed to the next one in line; other negotiations resolve at the next watchdog tick.' : 'no matching claims'
+        };
       } catch (error) {
         return { ok: false, sessionId: '', released: 0, hint: String((error && error.message) || error) };
       }
@@ -217,7 +230,11 @@ export function buildTools({ registry, negotiations, delivery, coordinator, metr
         if (!neg && (action === 'offer' || action === 'counter')) {
           const holder = registry.othersOn(entry.key, caller.sessionId, now, caller.parent).find((c) => c.origin === 'manual');
           if (!holder) return respond(false, null, false, `no manual claim by another session on ${entry.path}; nothing to negotiate (recent edits by others do not block you — claim_files it yourself)`);
-          neg = coordinator.openNegotiation(entry, holder.sessionId, holder.label, caller.sessionId, labelFor(caller.sessionId, caller.cwd), now).neg;
+          neg = coordinator.openNegotiation(entry, holder.sessionId, holder.label, caller.sessionId, labelFor(caller.sessionId, caller.cwd), now, {
+            parent: caller.parent,
+            cwd: caller.cwd,
+            origin: caller.origin
+          }).neg;
           if (!neg) return respond(false, null, false, 'could not open a negotiation');
           // 不在此处单独通知持有方：下面的 offer 转移会带着条款通知一次，避免重复打扰。
         }
@@ -243,9 +260,11 @@ export function buildTools({ registry, negotiations, delivery, coordinator, metr
   };
 
   const summaryOf = (neg, released) => {
+    const queueNote = neg.state === 'queued' ? ` queue-position=${negotiations.positionOf(neg, Date.now())}` : '';
+    const handoff = neg.handoffTo ? ` handoff-to=${shortId(neg.handoffTo)}` : '';
     const offer = neg.lastOffer && neg.lastOffer.terms ? ` lastOffer=${neg.lastOffer.terms.action}${neg.lastOffer.terms.at ? '@' + iso(neg.lastOffer.terms.at) : ''} by ${shortId(neg.lastOffer.by)}` : '';
-    const pending = neg.pendingReleaseAt ? ` scheduled-release=${iso(neg.pendingReleaseAt)}` : neg.pendingWakeAt ? ` writer-wake=${iso(neg.pendingWakeAt)}` : '';
-    return `state=${neg.state} round=${neg.rounds}/${negotiations.maxRounds}${neg.resolution ? ` (${neg.resolution})` : ''}${offer}${released ? ' holder-claim-released' : ''}${pending} deadline=${iso(neg.deadline)}`;
+    const pending = neg.pendingReleaseAt ? ` scheduled-handoff=${iso(neg.pendingReleaseAt)}` : neg.pendingWakeAt ? ` writer-wake=${iso(neg.pendingWakeAt)}` : '';
+    return `state=${neg.state}${queueNote} round=${neg.rounds}/${negotiations.maxRounds}${neg.resolution ? ` (${neg.resolution})` : ''}${offer}${handoff}${released ? ' claim-handed-over' : ''}${pending} deadline=${iso(neg.deadline)}`;
   };
 
   const statusDetail = (caller, entry, now) => {

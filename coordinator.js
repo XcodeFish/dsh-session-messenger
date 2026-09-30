@@ -11,6 +11,9 @@
  * - 自动通知不唤醒空闲/冷会话（M5，见 delivery.notify）。
  * - v0.4.1：只有他人的**手动** claim 才构成冲突（开协商 + 争议冻结）；他人的自动 claim
  *   只是「最近写过」，写入照常登记，只给写入方一条节流的重叠提示。
+ * - v0.4.2 多写入方：谈成即**原子移交**占用给谈成方（registry.transfer），同文件其余写入方
+ *   转入 queued 并告知排队位次；移交完成或占用方释放/过期/被销毁时，队首改绑到新占用方
+ *   重新 open（advanceQueue）。占用方主动释放时同样直接交给队首，不留「谁抢到算谁的」窗口。
  */
 import { randomUUID } from 'node:crypto';
 import { ENVELOPE_TAG, createThrottle, intentInfo, isWithin, iso, labelFor, shortId } from './util.js';
@@ -84,12 +87,28 @@ export function createCoordinator({ registry, negotiations, delivery, logger, me
         ask.push(`${call('counter', ', terms:{action:"wait-until", at:"<ISO>"}')}  还价`);
         ask.push(`${call('decline')}  拒绝（请改别的文件）`);
       }
+    } else if (neg.state === 'queued') {
+      const pending = negotiations && negotiations.pendingHandoff(neg.key);
+      const pos = negotiations ? negotiations.positionOf(neg, Date.now()) : 0;
+      const to = pending ? labelOf(pending, pending.handoffTo) : '下一位';
+      ask.push(
+        `排队中${pos ? `（第 ${pos} 位）` : ''}：占用方已约定把该文件移交给 ${to}${pending ? `（${iso(pending.pendingReleaseAt)}）` : ''}。` +
+          '在此期间你对该文件的写入仍被冻结；移交完成后你会收到通知，届时改与新占用方协商。不想等可以：'
+      );
+      ask.push(`${call('decline')}  退出排队，先做别的`);
     } else if (neg.state === 'escalated') {
       ask.push('协商未收敛，已请求人工裁决。默认结论：占用方保留 claim（写入方在冷静期内对该文件的写入仍被冻结）。请向用户说明情况，或改做别的文件。');
     } else if (neg.state === 'accepted') {
-      if (neg.pendingReleaseAt) ask.push(`已达成：占用方将在 ${iso(neg.pendingReleaseAt)} 自动释放，届时可直接写入。`);
-      else if (neg.pendingWakeAt) ask.push(`已达成：写入方等待至 ${iso(neg.pendingWakeAt)}，到点会收到重试提醒。`);
-      else ask.push('已达成：占用已释放，可继续。');
+      const toMe = neg.handoffTo && neg.handoffTo === forId;
+      if (neg.pendingReleaseAt && neg.handoffTo) {
+        ask.push(toMe ? `已达成：占用将在 ${iso(neg.pendingReleaseAt)} 直接移交给你，届时可直接写入（无需再 claim）。` : `已达成：你将在 ${iso(neg.pendingReleaseAt)} 把该文件的占用移交给 ${labelOf(neg, neg.handoffTo)}。`);
+      } else if (neg.pendingWakeAt) {
+        ask.push(`已达成：写入方等待至 ${iso(neg.pendingWakeAt)}，到点会收到重试提醒。`);
+      } else if (neg.handoffTo) {
+        ask.push(toMe ? '已达成：该文件的占用已移交给你，可以直接写入；用完请 release_files（排队的会话会自动接手）。' : `已达成：该文件的占用已移交给 ${labelOf(neg, neg.handoffTo)}。`);
+      } else {
+        ask.push('已达成：占用已释放，可继续。');
+      }
     } else {
       ask.push(`协商已结束（${neg.resolution || neg.state}）。`);
     }
@@ -107,9 +126,10 @@ export function createCoordinator({ registry, negotiations, delivery, logger, me
     [`${ENVELOPE_TAG} · auto]]`, `notice: ${PEER_NOTICE}`, `corr: ${randomUUID().slice(0, 8)}`, `type: ${type}`, ...lines].join('\n');
 
   // --------------------------------------------------------------- 协商动作
-  const openNegotiation = (entry, holderId, holderLabel, writerId, writerLabel, now) => {
+  const openNegotiation = (entry, holderId, holderLabel, writerId, writerLabel, now, writerMeta = {}) => {
     if (!negotiations) return { neg: null, created: false };
     const res = negotiations.open({
+      writerMeta,
       id: randomUUID().slice(0, 8),
       path: entry.path,
       key: entry.key,
@@ -136,12 +156,113 @@ export function createCoordinator({ registry, negotiations, delivery, logger, me
     return count > 0;
   };
 
-  /** 协商副作用执行（释放）。供 negotiate 工具与看门狗共用。 */
+  /** 队列中某一方作为 claim 接收方的身份。 */
+  const recipientOf = (neg) => {
+    const meta = neg.writerMeta || {};
+    return {
+      sessionId: neg.writer,
+      parent: meta.parent || '',
+      label: labelOf(neg, neg.writer),
+      cwd: meta.cwd || delivery.sessionCwd(neg.writer),
+      sessionOrigin: meta.origin === 'subagent' ? 'subagent' : 'session'
+    };
+  };
+
+  /**
+   * 队列推进：key 的占用刚交到 holderId 手上（移交完成）或刚空出来（holderId 为空），
+   * 把其余排队者改绑到新占用方并重新 open；路径空出时由队首直接接手。
+   * @param doneId - 刚完成的那份协商（不再参与）
+   */
+  const advanceQueue = (key, holderId, holderLabel, now, doneId = '') => {
+    if (!negotiations) return;
+    let queue = negotiations.queueFor(key, now, doneId).filter((n) => n.writer !== holderId);
+    // 已被销毁的子代理不能接手
+    queue = queue.filter((n) => {
+      if ((n.writerMeta || {}).origin !== 'subagent' || delivery.liveAgent(n.writer)) return true;
+      negotiations.mark(n, 'resolved', 'writer subagent is gone', now);
+      return false;
+    });
+    let currentHolder = holderId;
+    let currentLabel = holderLabel;
+    if (!currentHolder && queue.length > 0) {
+      // 路径空出：队首直接接手（先登记 claim，再通知）。
+      const head = queue.shift();
+      const who = recipientOf(head);
+      // 接手者可能已经转去做别的：给短 TTL（同自动登记），它真要长期改再自行 claim_files 延长。
+      const got = registry.claim({ ...who, entries: [{ path: head.path, key }], ttlSeconds: settings.autoClaimTtlSeconds, note: 'took over from the queue', origin: 'manual', now });
+      if (got.registered) {
+        // 接手必须立刻落盘：看门狗路径（占用过期）不经过任何工具，没有别处会替它 persist，
+        // 否则重启后接手记录丢失、队首又变回「等待」。
+        persistClaims();
+        negotiations.mark(head, 'accepted', `${who.label} took over the file from the queue`, now);
+        head.handoffTo = head.writer;
+        head.pendingWakeAt = 0;
+        metrics.handoffs += 1;
+        notifyNegotiation(head, head.writer);
+        currentHolder = head.writer;
+        currentLabel = who.label;
+      } else {
+        queue.unshift(head);
+        const other = got.conflicts[0];
+        currentHolder = other ? other.ownerSessionId : '';
+        currentLabel = other ? other.ownerLabel : '';
+      }
+    }
+    if (!currentHolder) return;
+    for (const n of queue) {
+      if (n.writer === currentHolder) continue;
+      negotiations.rebind(n, currentHolder, currentLabel, now);
+      metrics.requeued += 1;
+      notifyNegotiation(n, n.writer);
+    }
+    if (queue.length > 0) {
+      const first = queue.find((n) => n.writer !== currentHolder);
+      if (first) notifyNegotiation(first, currentHolder);
+    }
+  };
+
+  /** 执行一次约定的移交：claim 原子转给谈成方，队列改绑到新占用方。返回是否已移交。 */
+  const executeHandoff = (neg, now) => {
+    const who = recipientOf(neg);
+    const moved = registry.transfer(neg.holder, neg.key, who, now);
+    if (!moved) {
+      // 占用方已经不持有（提前释放/过期）：按路径空出处理，谈成方排在最前。
+      advanceQueue(neg.key, '', '', now, '');
+      persistClaims();
+      return false;
+    }
+    metrics.handoffs += 1;
+    persistClaims();
+    advanceQueue(neg.key, who.sessionId, who.label, now, neg.id);
+    return true;
+  };
+
+  /** 协商副作用执行。供 negotiate 工具与看门狗共用。 */
   const applyEffects = (neg, effects, now) => {
-    if (effects && effects.releaseSessionId && effects.releaseAt && effects.releaseAt <= now) {
+    if (!effects) return false;
+    if (effects.handoff) {
+      if (effects.releaseAt && effects.releaseAt <= now) return executeHandoff(neg, now);
+      // 约定到点移交：其余写入方先转入排队并告知位次。
+      for (const other of negotiations ? negotiations.queueOthers(neg, now) : []) notifyNegotiation(other, other.writer);
+      return false;
+    }
+    if (effects.releaseSessionId && effects.releaseAt && effects.releaseAt <= now) {
       return releaseClaim(effects.releaseSessionId, neg.key);
     }
     return false;
+  };
+
+  /** 占用方主动释放（release_files）后：该路径上若有人排队，直接交给队首。 */
+  const handleReleased = (sessionId, keys, now) => {
+    if (!negotiations) return;
+    for (const key of keys) {
+      if (registry.othersOn(key, '', now).some((c) => c.origin === 'manual')) continue;
+      const waiting = negotiations.queueFor(key, now).filter((n) => n.holder === sessionId || n.state === 'queued');
+      if (waiting.length === 0) continue;
+      for (const n of waiting) if (n.state === 'open' && n.holder === sessionId) n.state = 'queued';
+      advanceQueue(key, '', '', now);
+    }
+    persistNegotiations();
   };
 
   // ------------------------------------------------------------------ L0/L1
@@ -214,9 +335,14 @@ export function createCoordinator({ registry, negotiations, delivery, logger, me
         metrics.cooldownSuppressed += 1;
         return;
       }
-      const { neg, created } = openNegotiation(entry, conflict.ownerSessionId, conflict.ownerLabel, writerId, writerLabel, now);
+      const { neg, created } = openNegotiation(entry, conflict.ownerSessionId, conflict.ownerLabel, writerId, writerLabel, now, {
+        parent: info.parent,
+        cwd: writerCwd,
+        origin: info.origin
+      });
       if (neg && created) {
-        notifyNegotiation(neg, neg.holder);
+        // 已约定移交时新来者直接排队：只通知它本人，不打扰占用方。
+        if (neg.state !== 'queued') notifyNegotiation(neg, neg.holder);
         notifyNegotiation(neg, neg.writer);
       }
       return;
@@ -297,9 +423,25 @@ export function createCoordinator({ registry, negotiations, delivery, logger, me
     }
     if (!negotiations) return;
     const now = Date.now();
+    const freedKeys = new Set();
     for (const neg of negotiations.openForSession(String(id))) {
+      if (neg.holder === id) {
+        freedKeys.add(neg.key); // 占用方没了：交给队列，不直接结束对方的等待
+        continue;
+      }
       negotiations.mark(neg, 'resolved', `party ${labelOf(neg, id)} was disposed`, now);
       notifyNegotiation(neg, neg.a === id ? neg.b : neg.a);
+    }
+    for (const neg of negotiations.negotiations.values()) {
+      if (neg.state === 'accepted' && neg.pendingReleaseAt && (neg.holder === id || neg.handoffTo === id)) {
+        neg.pendingReleaseAt = 0;
+        negotiations.mark(neg, 'resolved', `party ${labelOf(neg, id)} was disposed before the handoff`, now);
+        freedKeys.add(neg.key);
+      }
+    }
+    for (const key of freedKeys) {
+      for (const n of negotiations.queueFor(key, now)) if (n.holder === id && n.state === 'open') n.state = 'queued';
+      advanceQueue(key, '', '', now);
     }
     persistNegotiations();
   };
@@ -317,8 +459,9 @@ export function createCoordinator({ registry, negotiations, delivery, logger, me
         notifyNegotiation(neg, neg.writer);
       }
       for (const neg of dueReleases) {
-        releaseClaim(neg.holder, neg.key);
-        logger?.info?.(`[session-messenger] negotiation ${neg.id} applied scheduled release for ${neg.path}`);
+        if (neg.handoffTo) executeHandoff(neg, now);
+        else releaseClaim(neg.holder, neg.key);
+        logger?.info?.(`[session-messenger] negotiation ${neg.id} applied scheduled ${neg.handoffTo ? 'handoff' : 'release'} for ${neg.path}`);
         notifyNegotiation(neg, neg.holder);
         notifyNegotiation(neg, neg.writer);
       }
@@ -331,11 +474,22 @@ export function createCoordinator({ registry, negotiations, delivery, logger, me
           .map((c) => `${c.sessionId}\u0000${c.key}`)
       );
       let resolved = 0;
+      const vacated = new Set();
       for (const neg of negotiations.negotiations.values()) {
         if (neg.state !== 'open' || heldKeys.has(`${neg.holder}\u0000${neg.key}`)) continue;
-        negotiations.mark(neg, 'resolved', 'holder no longer holds the claim; path is free', now);
+        // 占用方不再持有（过期 / 只剩自动登记）：与主动释放同一语义——交给等待中的队首。
+        vacated.add(neg.key);
+        neg.state = 'queued';
+      }
+      for (const key of vacated) {
+        advanceQueue(key, '', '', now);
         resolved += 1;
-        notifyNegotiation(neg, neg.holder);
+      }
+      // 升级后仍在冷静期的协商：占用方已不再持有（过期/释放）时，告诉写入方可以写了。
+      for (const neg of negotiations.negotiations.values()) {
+        if (neg.state !== 'escalated' || heldKeys.has(`${neg.holder}\u0000${neg.key}`)) continue;
+        negotiations.mark(neg, 'resolved', 'holder no longer holds the claim after escalation; path is free', now);
+        resolved += 1;
         notifyNegotiation(neg, neg.writer);
       }
       const removed = negotiations.prune(now, settings.negRetentionMs);
@@ -345,6 +499,6 @@ export function createCoordinator({ registry, negotiations, delivery, logger, me
     }
   };
 
-  const api = { handleWriteIntent, handleSessionDisposed, runWatchdogOnce, renderNegotiation, notifyNegotiation, openNegotiation, applyEffects, persistClaims, persistNegotiations, onSignificant: undefined, statusText: undefined };
+  const api = { handleWriteIntent, handleSessionDisposed, handleReleased, runWatchdogOnce, renderNegotiation, notifyNegotiation, openNegotiation, applyEffects, persistClaims, persistNegotiations, onSignificant: undefined, statusText: undefined };
   return api;
 }

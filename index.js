@@ -36,7 +36,7 @@ export const name = 'session-messenger';
 export const inject = ['tools'];
 
 const SERVICE_FALLBACK_MS = 3000;
-export const VERSION = '0.4.1';
+export const VERSION = '0.4.2';
 
 function readSettings(config) {
   const cfg = config && typeof config === 'object' ? config : {};
@@ -139,7 +139,7 @@ export function apply(ctx, config) {
 
       const metrics = {
         autoClaims: 0, overlaps: 0, conflicts: 0, notifies: 0, notifySkippedCold: 0, denies: 0, unattributed: 0, outOfScope: 0,
-        releases: 0, escalations: 0, orphanCleared: 0, negotiationsOpened: 0, cooldownSuppressed: 0
+        releases: 0, escalations: 0, orphanCleared: 0, negotiationsOpened: 0, cooldownSuppressed: 0, handoffs: 0, requeued: 0
       };
       const delivery = new Delivery({
         sessions,

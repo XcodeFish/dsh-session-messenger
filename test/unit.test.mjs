@@ -10,6 +10,7 @@ import { NegotiationStore } from '../negotiation.js';
 import { acquireDataDir, JsonFile } from '../storage.js';
 import { createThrottle, createWindowLimiter, neutralizeEnvelope, oneLine, pathKey, sameFamily, toAbsolute, isLegacyLabel, originOfHeader } from '../util.js';
 import { createWriteGuard, guardMode } from '../write-guard.js';
+import { createCoordinator } from '../coordinator.js';
 
 const tmp = () => mkdtempSync(path.join(os.tmpdir(), 'msgr-unit-'));
 const E = (p) => ({ path: p, key: pathKey(p) });
@@ -307,4 +308,162 @@ test('write-guard: modes, tool coverage and fail-open', () => {
   if (env === undefined) delete process.env.DSH_SESSION_MESSENGER_HARD_GATE;
   else process.env.DSH_SESSION_MESSENGER_HARD_GATE = env;
   assert.equal(guardMode({ guard: 'nonsense' }), 'dispute');
+});
+
+// ------------------------------------------------ v0.4.2 同一文件多写入方
+function multi() {
+  const n = new NegotiationStore({ dataDir: tmp(), deadlineMs: 1000, maxRounds: 6, rateMs: 0, cooldownMs: 600000 });
+  const mk = (id, w, at) => n.open({ id, path: '/w/h.ts', key: '/w/h.ts', a: 'H', b: w, holder: 'H', writer: w, now: at }).neg;
+  return { n, b: mk('nb', 'B', T0), c: mk('nc', 'C', T0 + 10) };
+}
+
+test('queue: agreed handoff queues the other writers and blocks double promises', () => {
+  const { n, b, c } = multi();
+  n.transition(b, { by: 'H', action: 'offer', terms: { action: 'release-at', at: new Date(T0 + 60000).toISOString() }, now: T0 });
+  const r = n.transition(b, { by: 'B', action: 'accept', now: T0 });
+  assert.equal(r.effects.handoff, true);
+  assert.equal(b.handoffTo, 'B');
+  assert.deepEqual(n.queueOthers(b, T0).map((x) => x.id), ['nc']);
+  assert.equal(c.state, 'queued');
+  assert.equal(n.transition(c, { by: 'H', action: 'offer', terms: { action: 'release-now' }, now: T0 }).ok, false, 'holder cannot promise the file twice');
+  assert.equal(n.transition(c, { by: 'C', action: 'offer', terms: { action: 'wait-until', at: new Date(T0 + 5000).toISOString() }, now: T0 }).ok, false, 'queued writer cannot negotiate');
+  assert.equal(n.transition(c, { by: 'C', action: 'decline', now: T0 }).ok, true, 'queued writer can leave');
+});
+
+test('queue: queued negotiations never escalate by deadline and keep freezing', () => {
+  const { n, b, c } = multi();
+  n.transition(b, { by: 'H', action: 'offer', terms: { action: 'release-at', at: new Date(T0 + 60000).toISOString() }, now: T0 });
+  n.transition(b, { by: 'B', action: 'accept', now: T0 });
+  n.queueOthers(b, T0);
+  n.scan(T0 + 5000); // far beyond the 1s deadline
+  assert.equal(c.state, 'queued');
+  assert.ok(n.frozenFor('/w/h.ts', 'C', T0 + 5000, () => true), 'queued writer stays frozen');
+  assert.ok(n.frozenFor('/w/h.ts', 'B', T0 + 5000, () => true), 'agreed recipient waits until the handoff time');
+  assert.equal(n.frozenFor('/w/h.ts', 'H', T0 + 5000, () => true), undefined, 'holder keeps working until the handoff');
+});
+
+test('queue: newcomer after an agreed handoff is queued directly; order is first-come', () => {
+  const { n, b } = multi();
+  n.transition(b, { by: 'H', action: 'offer', terms: { action: 'release-at', at: new Date(T0 + 60000).toISOString() }, now: T0 });
+  n.transition(b, { by: 'B', action: 'accept', now: T0 });
+  n.queueOthers(b, T0);
+  const d = n.open({ id: 'nd', path: '/w/h.ts', key: '/w/h.ts', a: 'H', b: 'D', holder: 'H', writer: 'D', now: T0 + 20 }).neg;
+  assert.equal(d.state, 'queued');
+  assert.deepEqual(n.queueFor('/w/h.ts', T0).map((x) => x.writer), ['C', 'D']);
+  assert.equal(n.positionOf(d, T0), 2);
+});
+
+test('queue: rebind resets terms and reopens against the new holder', () => {
+  const { n, c } = multi();
+  n.transition(c, { by: 'C', action: 'offer', terms: { action: 'wait-until', at: new Date(T0 + 50000).toISOString() }, now: T0 });
+  c.state = 'queued';
+  n.rebind(c, 'B', 'B @ w', T0 + 100);
+  assert.equal(c.holder, 'B');
+  assert.equal(c.a, 'B');
+  assert.equal(c.b, 'C');
+  assert.equal(c.state, 'open');
+  assert.equal(c.rounds, 0);
+  assert.equal(c.lastOffer, null);
+  assert.equal(c.deadline, T0 + 100 + 1000);
+});
+
+test('queue: queued state and handoff target survive restart', async () => {
+  const dir = tmp();
+  const n = new NegotiationStore({ dataDir: dir, deadlineMs: 1000, maxRounds: 6, rateMs: 0 });
+  const b = n.open({ id: 'nb', path: '/w/h.ts', key: '/w/h.ts', a: 'H', b: 'B', holder: 'H', writer: 'B', writerMeta: { cwd: '/w' }, now: T0 }).neg;
+  n.open({ id: 'nc', path: '/w/h.ts', key: '/w/h.ts', a: 'H', b: 'C', holder: 'H', writer: 'C', now: T0 + 1 });
+  n.transition(b, { by: 'H', action: 'offer', terms: { action: 'release-at', at: new Date(Date.now() + 60000).toISOString() }, now: Date.now() });
+  n.transition(b, { by: 'B', action: 'accept', now: Date.now() });
+  n.queueOthers(b, Date.now());
+  await n.persist();
+  const again = new NegotiationStore({ dataDir: dir, deadlineMs: 1000, maxRounds: 6, rateMs: 0 });
+  await again.load(Date.now());
+  assert.equal(again.byId('nc').state, 'queued');
+  assert.equal(again.byId('nb').handoffTo, 'B');
+  assert.equal(again.byId('nb').writerMeta.cwd, '/w');
+  assert.ok(again.pendingHandoff('/w/h.ts'));
+});
+
+test('registry: transfer is atomic and keeps the longer lifetime', () => {
+  const r = new ClaimRegistry({ dataDir: tmp() });
+  r.claim({ sessionId: 'H', entries: [E('/w/h.ts')], ttlSeconds: 3600, origin: 'manual', note: 'refactor', now: T0 });
+  r.claim({ sessionId: 'B', entries: [E('/w/h.ts')], ttlSeconds: 600, origin: 'auto', now: T0 }); // B's auto row is an overlap
+  const moved = r.transfer('H', pathKey('/w/h.ts'), { sessionId: 'B', label: 'B @ w' }, T0 + 1000, 1800);
+  assert.equal(moved.sessionId, 'B');
+  assert.equal(moved.origin, 'manual');
+  assert.equal(moved.expiresAt, T0 + 3600 * 1000);
+  assert.match(moved.note, /handed over by/);
+  assert.equal(r.own('H', pathKey('/w/h.ts')), undefined);
+  assert.equal(r.listLive(T0 + 1000).filter((c) => c.key === pathKey('/w/h.ts')).length, 1, 'no duplicate rows');
+  assert.equal(r.transfer('H', pathKey('/w/h.ts'), { sessionId: 'C' }, T0 + 2000), undefined, 'nothing to transfer twice');
+});
+
+function coord(extra = {}) {
+  const dir = tmp();
+  const r = new ClaimRegistry({ dataDir: dir });
+  r.ready = true;
+  const n = new NegotiationStore({ dataDir: dir, deadlineMs: 600000, maxRounds: 6, rateMs: 0, cooldownMs: 600000 });
+  n.ready = true;
+  const sent = [];
+  const metrics = new Proxy({}, { get: (t, k) => t[k] || 0, set: (t, k, v) => ((t[k] = v), true) });
+  const delivery = { notify: (id, text) => (sent.push({ id, text }), 'injected'), liveAgent: () => ({}), liveSessions: () => [], sessionCwd: () => '/w', ...extra };
+  const c = createCoordinator({ registry: r, negotiations: n, delivery, logger: {}, metrics, settings: { autoClaimTtlSeconds: 600, negRetentionMs: 1800000, autoNotify: true, scopeToWorkspace: false, overlapCooldownMs: 0 } });
+  return { r, n, c, sent, metrics };
+}
+
+test('coordinator: holder claim EXPIRES while a writer waits → the writer takes over (persisted)', async () => {
+  const { r, n, c, sent } = coord();
+  const P = '/w/e.ts';
+  const key = pathKey(P);
+  r.claim({ sessionId: 'A', entries: [{ path: P, key }], ttlSeconds: 30, origin: 'manual', now: Date.now() });
+  n.open({ id: 'x', path: P, key, a: 'A', b: 'B', holder: 'A', writer: 'B', writerMeta: { cwd: '/w' }, now: Date.now() });
+  for (const cl of r.claims.values()) cl.expiresAt = Date.now() - 1;
+  c.runWatchdogOnce();
+  assert.equal(n.byId('x').state, 'accepted');
+  assert.deepEqual(r.listLive(Date.now()).map((x) => `${x.sessionId}:${x.origin}`), ['B:manual']);
+  assert.ok(sent.some((m) => m.id === 'B' && /已移交给你/.test(m.text)));
+  await r.persist();
+  const again = new ClaimRegistry({ dataDir: r.file.file.replace(/\/claims\.json$/, '') });
+  await again.load(Date.now());
+  assert.equal(again.listLive(Date.now())[0].sessionId, 'B', 'takeover survives restart');
+});
+
+test('coordinator: a disposed subagent in the queue is skipped', () => {
+  const { r, n, c } = coord({ liveAgent: (id) => (id === 'sub' ? undefined : {}) });
+  const P = '/w/q.ts';
+  const key = pathKey(P);
+  r.claim({ sessionId: 'A', entries: [{ path: P, key }], ttlSeconds: 600, origin: 'manual', now: Date.now() });
+  n.open({ id: 's', path: P, key, a: 'A', b: 'sub', holder: 'A', writer: 'sub', writerMeta: { origin: 'subagent' }, now: Date.now() });
+  n.open({ id: 'd', path: P, key, a: 'A', b: 'D', holder: 'A', writer: 'D', now: Date.now() + 1 });
+  r.release('A', [key]);
+  c.handleReleased('A', [key], Date.now());
+  assert.deepEqual(r.listLive(Date.now()).map((x) => x.sessionId), ['D']);
+  assert.equal(n.byId('s').state, 'resolved');
+});
+
+test('coordinator: the holder\'s own child does not queue behind the holder', () => {
+  const { r, n, c } = coord();
+  const P = '/w/f.ts';
+  const key = pathKey(P);
+  r.claim({ sessionId: 'A', entries: [{ path: P, key }], ttlSeconds: 600, origin: 'manual', now: Date.now() });
+  c.handleWriteIntent('write', { targetKey: P, displayPath: P }, { agent: { id: 'kid', session: { header: { id: 'kid', cwd: '/w', origin: 'subagent', parentSession: 'A' } } } });
+  assert.equal(n.negotiations.size, 0, 'no negotiation inside one family');
+});
+
+test('coordinator: holder claim expires during the post-escalation cooldown → writer is unfrozen and told', () => {
+  const { r, n, c, sent } = coord();
+  const P = '/w/x.ts';
+  const key = pathKey(P);
+  const now = Date.now();
+  r.claim({ sessionId: 'A', entries: [{ path: P, key }], ttlSeconds: 30, origin: 'manual', now });
+  const neg = n.open({ id: 'e', path: P, key, a: 'A', b: 'B', holder: 'A', writer: 'B', now }).neg;
+  n.mark(neg, 'escalated', 'no response before deadline', now);
+  const g = createWriteGuard({ registry: r, negotiations: n, mode: 'dispute', metrics: { denies: 0 } });
+  const ex = { name: 'write', arguments: { file_path: P }, agent: { id: 'B', session: { header: { id: 'B', cwd: '/w' } } } };
+  assert.match(g(ex), /FROZEN/, 'frozen during cooldown while A holds');
+  for (const cl of r.claims.values()) cl.expiresAt = Date.now() - 1;
+  assert.equal(g(ex), undefined, 'guard lifts immediately once A no longer holds');
+  c.runWatchdogOnce();
+  assert.equal(neg.state, 'resolved');
+  assert.ok(sent.some((m) => m.id === 'B' && /path is free/.test(m.text)), 'writer is told the path is free');
 });

@@ -164,10 +164,11 @@ check('B2 对方紧接着 accept 不被限速 (M3)', accept.ok && accept.state =
 const again = await call('negotiate', { action: 'status', path: P1 }, 'session-B');
 check('B3 accepted 后到点前写入方仍冻结', /FROZEN/.test(guard('session-B', 'write', { file_path: P1 }) || ''), again.detail);
 await sleep(1500);
-check('B4 到点看门狗释放 claim', (await claimsOn(P1)).length === 0);
-check('B5 释放后写入方解冻', guard('session-B', 'write', { file_path: P1 }) === undefined);
-const takeover = await call('claim_files', { paths: [P1], note: 'B takes over' }, 'session-B');
-check('B6 写入方接手 claim', takeover.registered === true);
+const afterB = await claimsOn(P1);
+check('B4 到点看门狗把占用直接移交给谈成方（不先放空）', afterB.length === 1 && afterB[0].sessionId === 'session-B' && afterB[0].origin === 'manual', afterB.map((c) => c.sessionId).join(','));
+check('B5 移交后谈成方解冻', guard('session-B', 'write', { file_path: P1 }) === undefined);
+check('B6 原占用方写入不再豁免（已不是持有方）', guard('session-A', 'write', { file_path: P1 }) === undefined && (await call('claim_files', { paths: [P1] }, 'session-A')).registered === false);
+await call('release_files', { paths: [P1] }, 'session-B');
 
 // ---------------------------------------------------------------- G: 长约定不被剪枝
 const PG = `${WS}/src/long.ts`;
@@ -217,8 +218,10 @@ await app.plugin({
 });
 S['sub-2'].live = false;
 await sleep(120);
-check('D5 子代理销毁 → 其 claim 立即释放', (await claimsOn(P4)).length === 0);
-check('D6 子代理销毁 → 协商收敛 resolved', ((await negsOn(P4))[0] || {}).state === 'resolved');
+const p4 = await claimsOn(P4);
+check('D5 子代理销毁 → 其 claim 立即清除，等待中的写入方接手', p4.length === 1 && p4[0].sessionId === 'session-A', p4.map((c) => c.sessionId).join(','));
+check('D6 子代理销毁 → 协商收敛（写入方接手）', ((await negsOn(P4))[0] || {}).state === 'accepted');
+await call('release_files', { paths: [P4] }, 'session-A');
 check('D7 持久会话 disposed（卸载）不清 claim', await (async () => {
   await app.plugin({ name: 'dispose-z', apply(ctx) { ctx.emit('session/disposed', { id: 'session-Z', header: header('session-Z') }); } });
   await sleep(80);
@@ -276,11 +279,73 @@ check('S3 跨工作区会话默认不可达、候选不泄露', cross.ok === fal
 const toSub = await call('send_to_session', { target: 'session-B', content: 'hi' }, 'session-B');
 check('S4 自发被拒', toSub.ok === false && /self-send/.test(toSub.detail));
 
+// ------------------------------------------------ Q: 同一文件多写入方（移交 + 排队，v0.4.2）
+S['session-C'] = { cwd: WS, live: true, status: 'running' };
+S['session-D'] = { cwd: WS, live: true, status: 'running' };
+const PQ = `${WS}/src/hot.ts`;
+await call('claim_files', { paths: [PQ], ttl_seconds: 600, note: 'A holds hot' }, 'session-A');
+await writeIntent('session-B', PQ);
+await writeIntent('session-C', PQ);
+const negsQ0 = await negsOn(PQ);
+check('Q1 两个写入方各自与占用方开桌', negsQ0.length === 2 && negsQ0.every((n) => n.state === 'open'));
+const nB = negsQ0.find((n) => n.writer === 'session-B');
+const nC = negsQ0.find((n) => n.writer === 'session-C');
+await call('negotiate', { action: 'offer', corr: nB.id, path: PQ, terms: { action: 'release-at', at: new Date(Date.now() + 1200).toISOString() } }, 'session-A');
+prompts.length = 0;
+const accQ = await call('negotiate', { action: 'accept', corr: nB.id, path: PQ }, 'session-B');
+check('Q2 B 接受约定移交', accQ.ok && accQ.state === 'accepted' && /handoff-to=B/.test(accQ.detail), accQ.detail);
+const nC1 = (await negsOn(PQ)).find((n) => n.id === nC.id);
+check('Q3 C 的协商转入 queued 并收到排队通知（第 1 位）', nC1.state === 'queued' && to('session-C', '排队中（第 1 位）').length === 1);
+const dbl = await call('negotiate', { action: 'offer', corr: nC.id, path: PQ, terms: { action: 'wait-until', at: new Date(Date.now() + 60000).toISOString() } }, 'session-C');
+check('Q4 排队中不能另行谈条件', dbl.ok === false && /queued/.test(dbl.detail), dbl.detail);
+await writeIntent('session-D', PQ);
+const nD = (await negsOn(PQ)).find((n) => n.writer === 'session-D');
+check('Q5 晚到的 D 直接排队、不打扰占用方', nD && nD.state === 'queued' && to('session-A', `neg: ${nD.id}`).length === 0);
+check('Q6 排队期间 C、D 仍冻结，谈成的 B 到点前也冻结', ['session-B', 'session-C', 'session-D'].every((id) => /FROZEN/.test(guard(id, 'write', { file_path: PQ }) || '')));
+await sleep(1600);
+const afterQ = await claimsOn(PQ);
+check('Q7 到点占用直接移交给谈成的 B（C/D 没有抢占窗口）', afterQ.length === 1 && afterQ[0].sessionId === 'session-B', afterQ.map((c) => c.sessionId).join(','));
+const negsQ2 = await negsOn(PQ);
+const c2 = negsQ2.find((n) => n.id === nC.id);
+const d2 = negsQ2.find((n) => n.id === nD.id);
+check('Q8 C、D 改绑到新占用方 B 并重新开桌', c2.holder === 'session-B' && c2.state === 'open' && d2.holder === 'session-B' && d2.state === 'open', `${c2.holder}/${c2.state} ${d2.holder}/${d2.state}`);
+check('Q9 B 写入放行，C/D 仍冻结', guard('session-B', 'write', { file_path: PQ }) === undefined && /FROZEN/.test(guard('session-C', 'write', { file_path: PQ }) || '') && /FROZEN/.test(guard('session-D', 'write', { file_path: PQ }) || ''));
+check('Q10 C 收到「占用方已变为 B」的新协商', to('session-C', 'peer: B @').length >= 1);
+const leave = await call('negotiate', { action: 'decline', corr: nD.id, path: PQ }, 'session-D');
+check('Q11 D 可以 decline 退出队列', leave.ok && leave.state === 'declined');
+prompts.length = 0;
+await call('release_files', { paths: [PQ] }, 'session-B');
+const afterRel = await claimsOn(PQ);
+check('Q12 B 主动释放 → 直接交给队首 C（不是放空）', afterRel.length === 1 && afterRel[0].sessionId === 'session-C', afterRel.map((c) => c.sessionId).join(','));
+check('Q13 C 收到接手通知', to('session-C', '已移交给你').length === 1);
+check('Q14 C 解冻、退出队列的 D 不再冻结', guard('session-C', 'write', { file_path: PQ }) === undefined && guard('session-D', 'write', { file_path: PQ }) === undefined);
+await call('release_files', { paths: [PQ] }, 'session-C');
+check('Q15 队列走完后路径空出', (await claimsOn(PQ)).length === 0);
+
+// ------------------------------------------------ R: 队列边界（接手方消失 / 占用过期 / 无人排队）
+const PR = `${WS}/src/edge.ts`;
+S['sub-3'] = { cwd: WS, live: true, status: 'running', origin: 'subagent', parent: 'session-C' };
+await call('claim_files', { paths: [PR], ttl_seconds: 600 }, 'session-A');
+await writeIntent('sub-3', PR); // 排队首位：一个子代理
+await writeIntent('session-D', PR); // 第二位
+S['sub-3'].live = false; // 子代理结束
+await app.plugin({ name: 'dispose-sub3', apply(ctx) { ctx.emit('session/disposed', { id: 'sub-3', header: header('sub-3') }); } });
+await sleep(80);
+prompts.length = 0;
+await call('release_files', { paths: [PR] }, 'session-A');
+const pr = await claimsOn(PR);
+check('R1 队首子代理已销毁 → 跳过它，交给下一位 D', pr.length === 1 && pr[0].sessionId === 'session-D', pr.map((c) => c.sessionId).join(','));
+await call('release_files', { paths: [PR] }, 'session-D');
+check('R2 队列为空时释放 → 路径空出', (await claimsOn(PR)).length === 0);
+
+// 占用过期后的接手/解冻由单测 'coordinator: holder claim EXPIRES…' 与 '…after escalation' 用受控时钟覆盖
+// （探针的冷静期被缩短到 3s，无法在 30s 最小 TTL 内复现生产的 10 分钟冷静期）。
+
 // ---------------------------------------------------------------- M: status.json 指标落盘
 await sleep(1300); // 事件后 1s 去抖写
 const statusJson = await readJson('status.json');
 const bootM = statusJson.boot || {};
-check('M1 status.json 在事件后刷新，指标反映本次运行', statusJson.version === '0.4.1' && bootM.overlaps >= 1 && bootM.conflicts >= 1 && bootM.denies >= 1 && statusJson.settings && statusJson.settings.guard === 'dispute', JSON.stringify(bootM).slice(0, 160));
+check('M1 status.json 在事件后刷新，指标反映本次运行', /^0\.4\.\d+$/.test(statusJson.version) && bootM.overlaps >= 1 && bootM.conflicts >= 1 && bootM.denies >= 1 && bootM.handoffs >= 2 && bootM.requeued >= 2 && statusJson.settings && statusJson.settings.guard === 'dispute', JSON.stringify(bootM).slice(0, 160));
 
 // ---------------------------------------------------------------- 收尾
 const names = registered.map((d) => d.name);
