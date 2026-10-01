@@ -1,8 +1,19 @@
 {
   "name": "dsh-session-messenger",
   "version": "0.4.2",
-  "private": true,
   "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/XcodeFish/dsh-session-messenger.git"
+  },
+  "keywords": [
+    "dsh",
+    "cordis",
+    "plugin",
+    "multi-agent",
+    "session"
+  ],
   "description": "Cross-session coordination for DSH: file-claim registry (manual claim_files plus auto-registration from fs write intents), multi-round structured negotiation (negotiate) with a dispute-scoped write freeze via tools.guard, a watchdog that escalates to the human and never auto-favours the writer, and rate-limited peer messaging (send_to_session) within one workspace.",
   "exports": {
     ".": "./index.js",
