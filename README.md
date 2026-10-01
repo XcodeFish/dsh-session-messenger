@@ -8,6 +8,19 @@ DSH 跨会话协作插件（host-only，零外部导入）。多个独立启动�
 - 状态：`~/.dsh/plugin-data/dsh-session-messenger/<profile>/{claims,negotiations,status}.json`（宿主进程拿不到 `DSH_PROFILE` 时 profile 名为 `default`；首次激活自动复制 v0.3 根目录旧数据，不删除原件）。
 - 运行指标：`status.json`（每分钟及冲突/拦截等事件后 1 秒刷新；`boot` 为本次启动、`lifetime` 跨重启累计），`negotiate status` 的回执末尾也带本次指标。
 
+## 安装
+
+```bash
+# 从 GitHub 安装到指定 profile
+dsh plugin --profile <profile> add github:XcodeFish/dsh-session-messenger
+# 或从本地目录安装（目录需长期保留，勿装完即删）
+dsh plugin --profile <profile> add ~/.dsh/plugin-src/dsh-session-messenger
+```
+
+重启 DSH 生效（代码变更必须重启才会加载）。验证：对任意会话说「查一下信使状态」，`negotiate status` 回执末尾应显示 `plugin v0.4.2`。
+
+详细步骤与本地验证见 [INSTALL.md](INSTALL.md)。
+
 ## 工具
 
 | 工具 | 作用 |
