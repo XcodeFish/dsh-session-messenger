@@ -11,7 +11,9 @@ DSH 跨会话协作插件（host-only，零外部导入）。多个独立启动�
 ## 安装
 
 ```bash
-# 从 GitHub 安装到指定 profile
+# 从 npm 安装（推荐）
+dsh plugin --profile <profile> add dsh-session-messenger
+# 从 GitHub 安装
 dsh plugin --profile <profile> add github:XcodeFish/dsh-session-messenger
 # 或从本地目录安装（目录需长期保留，勿装完即删）
 dsh plugin --profile <profile> add ~/.dsh/plugin-src/dsh-session-messenger
