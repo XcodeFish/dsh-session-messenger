@@ -2,3 +2,4 @@
 .repro/
 node_modules/
 *.tmp
+*.git.bundle
